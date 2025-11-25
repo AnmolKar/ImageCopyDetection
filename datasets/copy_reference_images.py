@@ -97,13 +97,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--csv-path",
-        default="/home/jowatson/Deep Learning/NDEC/public_ground_truth_h5.csv",
+        default="/home/ankarki/DeeplearningProj/NDEC/public_ground_truth_h5.csv",
         type=Path,
         help="Path to the public ground truth CSV file.",
     )
     parser.add_argument(
         "--first-shard",
-        default="/home/jowatson/Deep Learning/DISC21/refs_50k_0",
+        default="/home/ankarki/DeeplearningProj/DISC21/refs_50k_0",
         type=Path,
         help="Path to the refs_50k_0 directory (used to derive shard list).",
     )
@@ -115,7 +115,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--destination",
-        default="/home/jowatson/Deep Learning/NDEC/reference_set",
+        default="/home/ankarki/DeeplearningProj/NDEC/reference_set",
         type=Path,
         help="Directory to copy matched reference images into.",
     )
