@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-LOG_DIR="/home/jowatson/slurm_logs"
+LOG_DIR="/home/jowatson/Deep Learning/slurm_logs"
 PROJECT_ROOT="/home/jowatson/Deep Learning/Code"
 SCRIPT_PATH="${PROJECT_ROOT}/DINOv3_CED_SLURM.py"
 
