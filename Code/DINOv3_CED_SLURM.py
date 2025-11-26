@@ -18,7 +18,15 @@ import numpy as np
 from tqdm.auto import tqdm
 import torchvision.transforms as V
 
-code_dir = Path("/home/jowatson/Deep Learning/Code").resolve()
+SCRIPT_DIR = Path(__file__).resolve().parent
+WORKSPACE_ROOT = Path.cwd()
+if not (WORKSPACE_ROOT / "Code").exists():
+    WORKSPACE_ROOT = SCRIPT_DIR.parent
+
+code_dir = (WORKSPACE_ROOT / "Code").resolve()
+if not code_dir.exists():
+    code_dir = SCRIPT_DIR
+
 if str(code_dir) not in sys.path:
     sys.path.append(str(code_dir))
     print(f"Added {code_dir} to sys.path")
@@ -72,8 +80,9 @@ print("Using device:", device)
 # ------------------------------------------------------------------
 @dataclass
 class ExperimentConfig:
-    disc21_root: Path = Path("/home/jowatson/Deep Learning/DISC21")
-    ndec_root: Path = Path("/home/jowatson/Deep Learning/NDEC")
+    workspace_root: Path = WORKSPACE_ROOT
+    disc21_root: Path = (WORKSPACE_ROOT / "DISC21").resolve()
+    ndec_root: Path = (WORKSPACE_ROOT / "NDEC").resolve()
     model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     img_size_train: int = 224
     img_size_eval: int = 224
@@ -96,12 +105,12 @@ class ExperimentConfig:
     early_stopping_min_delta_disc21: float = 1e-4
     early_stopping_patience_ndec: int = 2
     early_stopping_min_delta_ndec: float = 1e-4
-    checkpoint_path: Path = Path("artifacts/checkpoints/ced_model_final.pt")
+    checkpoint_path: Path = (code_dir / "artifacts/checkpoints/ced_model_final.pt").resolve()
 
 
 @dataclass
 class NdecConfig:
-    root: Path = Path("/home/jowatson/Deep Learning/NDEC")
+    root: Path = (WORKSPACE_ROOT / "NDEC").resolve()
     img_size_train: int = 224
     img_size_eval: int = 224
     batch_size_pairs: int = 64

@@ -12,9 +12,26 @@ import torchvision.transforms as T
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DISC21_ROOT = Path(
-    os.environ.get("DISC21_PATH", "/home/jowatson/Deep Learning/DISC21")
-)
+SCRIPT_DIR = Path(__file__).resolve().parent
+CODE_DIR = SCRIPT_DIR.parent
+WORKSPACE_ROOT = CODE_DIR.parent if CODE_DIR.parent != CODE_DIR else CODE_DIR
+
+
+def _default_root_from_env(env_var: str, folder_name: str) -> Path:
+    env_path = os.environ.get(env_var)
+    if env_path:
+        return Path(env_path).expanduser()
+
+    candidates = [Path.cwd(), Path.cwd().parent, WORKSPACE_ROOT]
+    for base in candidates:
+        candidate = base / folder_name
+        if candidate.exists():
+            return candidate
+
+    return WORKSPACE_ROOT / folder_name
+
+
+DEFAULT_DISC21_ROOT = _default_root_from_env("DISC21_PATH", "DISC21")
 DEFAULT_IMG_EXTS = (".jpg", ".jpeg", ".png")
 
 
