@@ -7,8 +7,8 @@
 #SBATCH --partition=week-long-gpu
 #SBATCH --nodelist=gpu3
 #SBATCH --gres=gpu:A30:3
-#SBATCH --output=/home/jowatson/slurm_logs/dinov3_ced_gpu3_%j.out
-#SBATCH --error=/home/jowatson/slurm_logs/dinov3_ced_gpu3_%j.err
+#SBATCH --output="/home/jowatson/Deep Learning/slurm_logs/dinov3_ced_gpu3_%j.out"
+#SBATCH --error="/home/jowatson/Deep Learning/slurm_logs/dinov3_ced_gpu3_%j.err"
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=jowatson@clarku.edu
 
@@ -16,14 +16,28 @@ set -euo pipefail
 
 LOG_DIR="/home/jowatson/Deep Learning/slurm_logs"
 PROJECT_ROOT="/home/jowatson/Deep Learning/Code"
-SCRIPT_PATH="${PROJECT_ROOT}/DINOv3_CED_DDP.py"   # <- your DDP script
-NPROC_PER_NODE=3                                 # number of GPUs/processes
+SCRIPT_PATH="${PROJECT_ROOT}/DINOv3_CED_DDP.py"
+
+DEFAULT_NPROC=3                                                  # matches --gres request
+if [ -n "${SLURM_GPUS_ON_NODE:-}" ]; then
+    NPROC_PER_NODE=${SLURM_GPUS_ON_NODE}
+    GPU_SOURCE="SLURM_GPUS_ON_NODE"
+else
+    NPROC_PER_NODE=$DEFAULT_NPROC
+    GPU_SOURCE="fallback to SBATCH --gres"
+fi
+
+if [ "$NPROC_PER_NODE" -lt 1 ]; then
+    echo "[FATAL] NPROC_PER_NODE resolved to $NPROC_PER_NODE" >&2
+    exit 1
+fi
 
 mkdir -p "$LOG_DIR"
 
 echo "Host: $(hostname)"
 echo "Job ID: ${SLURM_JOB_ID:-none}"
-echo "GPUs requested: ${SLURM_GPUS_ON_NODE:-1}"
+echo "GPUs requested (per node): $NPROC_PER_NODE [$GPU_SOURCE]"
+echo "Torch processes per node: $NPROC_PER_NODE"
 
 # ----------------- OMP_NUM_THREADS tuning -----------------
 CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-32}

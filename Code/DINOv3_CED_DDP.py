@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import warnings
+import inspect
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, Tuple, List, Optional
@@ -12,6 +13,8 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
+from torch import amp
+import torch.backends.cudnn as cudnn
 
 from transformers import AutoModel, AutoProcessor
 from huggingface_hub import login
@@ -24,13 +27,12 @@ import torchvision.transforms as V
 # ======================================================================
 # Import your loaders + eval utilities
 # ======================================================================
-code_dir = Path("/home/jowatson/Deep Learning/Code").resolve()
-if str(code_dir) not in sys.path:
-    sys.path.append(str(code_dir))
+SCRIPT_DIR = Path(__file__).resolve().parent
+WORKSPACE_ROOT = SCRIPT_DIR.parent
+UTILITIES_DIR = SCRIPT_DIR / "Utilities"
 
-utilities_dir = code_dir / "Utilities"
-if str(utilities_dir) not in sys.path:
-    sys.path.append(str(utilities_dir))
+if str(UTILITIES_DIR) not in sys.path:
+    sys.path.append(str(UTILITIES_DIR))
 
 from disc21_loader import (  # type: ignore
     Disc21DataConfig,
@@ -83,6 +85,9 @@ def setup_distributed() -> Tuple[int, int, int]:
     else:
         # Fallback: single-process, single-GPU (no true DDP)
         rank, world_size, local_rank = 0, 1, 0
+        # torch.distributed uses env:// rendezvous, so provide sane defaults
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29500")
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
@@ -99,15 +104,15 @@ def cleanup_distributed():
 # ======================================================================
 @dataclass
 class ExperimentConfig:
-    disc21_root: Path = Path("/home/jowatson/Deep Learning/DISC21")
-    ndec_root: Path = Path("/home/jowatson/Deep Learning/NDEC")
+    disc21_root: Path = WORKSPACE_ROOT / "DISC21"
+    ndec_root: Path = WORKSPACE_ROOT / "NDEC"
     model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     img_size_train: int = 224
     img_size_eval: int = 224
-    batch_size_train: int = 64
-    batch_size_eval: int = 64
-    batch_size_pairs: int = 64
-    num_workers: int = 4
+    batch_size_train: int = 32
+    batch_size_eval: int = 32
+    batch_size_pairs: int = 32
+    num_workers: int = 4  # still used by Disc21DataConfig / NdecDataConfig
     lr_backbone: float = 1e-5
     lr_head: float = 1e-4
     weight_decay: float = 1e-4
@@ -135,16 +140,6 @@ class ExperimentConfig:
     checkpoint_path: Path = Path("artifacts/checkpoints/ced_model_ddp.pt")
 
 
-@dataclass
-class NdecConfig:
-    root: Path = Path("/home/jowatson/Deep Learning/NDEC")
-    img_size_train: int = 224
-    img_size_eval: int = 224
-    batch_size_pairs: int = 64
-    batch_size_eval: int = 64
-    num_workers: int = 4
-
-
 # ======================================================================
 # Backbone, aggregator, classifier, CEDModel
 # ======================================================================
@@ -153,13 +148,18 @@ class DinoV3Backbone(nn.Module):
 
     def __init__(self, model_name: str):
         super().__init__()
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        dtype = torch.float32  # keep backbone full precision for stability
 
         self.processor = self._load_processor(model_name)
-        self.model = AutoModel.from_pretrained(model_name, dtype=dtype, trust_remote_code=True)
+        self.model = AutoModel.from_pretrained(
+            model_name,
+            dtype=dtype,
+            trust_remote_code=True,
+        )
         self.model.to(device)
         self._supports_attn_impl = hasattr(self.model, "set_attn_implementation")
-        self._attn_impl_is_eager = False
+        current_impl = getattr(self.model, "_attn_implementation", None)
+        self._attn_impl_is_eager = current_impl == "eager"
         self.patch_size = getattr(self.model.config, "patch_size", 16)
         self.num_register_tokens = getattr(self.model.config, "num_register_tokens", 0)
         self.hidden_size = self.model.config.hidden_size
@@ -176,25 +176,28 @@ class DinoV3Backbone(nn.Module):
         except Exception:
             return AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 
-    @torch.inference_mode()
+    # NOTE: no @torch.inference_mode here – that caused the runtime error.
     def preprocess(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
-        images_np = [img.detach().cpu().permute(1, 2, 0).numpy() for img in images]
-        encoded = self.processor(images=images_np, return_tensors="pt")
+        # Use no_grad just for the CPU-side numpy + processor work
+        with torch.no_grad():
+            images_np = [img.detach().cpu().permute(1, 2, 0).numpy() for img in images]
+            encoded = self.processor(images=images_np, return_tensors="pt")
         encoded = {k: v.to(device) for k, v in encoded.items()}
         return encoded
 
-    def forward(self, pixel_values: torch.Tensor, output_attentions: bool = False) -> Dict[str, torch.Tensor]:
-        if output_attentions and self._supports_attn_impl and not self._attn_impl_is_eager:
+    def _ensure_eager_attn(self):
+        if self._supports_attn_impl and not self._attn_impl_is_eager:
             try:
                 self.model.set_attn_implementation("eager")
                 self._attn_impl_is_eager = True
             except Exception as exc:
                 warnings.warn(
-                    f"Unable to switch attention implementation to 'eager': {exc}. "
-                    "Attention maps may be unavailable.",
-                    stacklevel=1,
+                    f"DinoV3Backbone: unable to switch attention implementation to 'eager': {exc}"
                 )
 
+    def forward(self, pixel_values: torch.Tensor, output_attentions: bool = False) -> Dict[str, torch.Tensor]:
+        if output_attentions:
+            self._ensure_eager_attn()
         outputs = self.model(
             pixel_values=pixel_values,
             output_attentions=output_attentions,
@@ -251,7 +254,10 @@ class CEDFeatureAggregator(nn.Module):
 
     @staticmethod
     def gem(x: torch.Tensor, p: float = 3.0, eps: float = 1e-6) -> torch.Tensor:
-        x = x.clamp(min=eps).pow(p)
+        # Force stable fp32 math and avoid huge values in pow
+        x = x.float()
+        x = x.clamp(min=eps)
+        x = x.pow(p)
         x = x.mean(dim=1)
         return x.pow(1.0 / p)
 
@@ -260,12 +266,12 @@ class CEDFeatureAggregator(nn.Module):
         patch_tokens_flat: torch.Tensor,
         attn_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        weighted_tokens = patch_tokens_flat
+        weighted_tokens = patch_tokens_flat.float()
         if attn_weights is not None:
-            weights = attn_weights.view(attn_weights.size(0), -1)
+            weights = attn_weights.view(attn_weights.size(0), -1).float()
             weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-6)
             weights = weights.unsqueeze(-1)
-            weighted_tokens = patch_tokens_flat * (weights + 1e-6)
+            weighted_tokens = weighted_tokens * (weights + 1e-6)
 
         local = self.gem(weighted_tokens, p=self.gem_p)
         local = self.proj_loc(local)
@@ -278,7 +284,7 @@ class CEDFeatureAggregator(nn.Module):
         attn_weights: Optional[torch.Tensor] = None,
         return_local: bool = False,
     ) -> torch.Tensor:
-        cls_global = self.proj_cls(cls)
+        cls_global = self.proj_cls(cls.float())
         cls_global = F.normalize(cls_global, dim=-1)
         local = self.compute_local_embedding(patch_tokens_flat, attn_weights=attn_weights)
         descriptor = torch.cat([cls_global, local], dim=-1)
@@ -345,24 +351,25 @@ class CEDModel(nn.Module):
     def __init__(self, backbone: DinoV3Backbone, dim: int):
         super().__init__()
         self.backbone = backbone
-        model_dtype = next(self.backbone.parameters()).dtype
         self.aggregator = CEDFeatureAggregator(dim=dim, gem_p=3.0, use_proj=True)
-        self.aggregator = self.aggregator.to(device=device, dtype=model_dtype)
+        self.aggregator = self.aggregator.to(device=device, dtype=torch.float32)
         self.classifier = CopyEditClassifier(dim=dim)
-        self.classifier = self.classifier.to(device=device, dtype=model_dtype)
+        self.classifier = self.classifier.to(device=device, dtype=torch.float32)
 
     def encode_images(
         self,
         images: torch.Tensor,
         return_local: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        feats = self.backbone.get_features_from_images(images, output_attentions=True)
-        agg_out = self.aggregator(
-            cls=feats["cls"],
-            patch_tokens_flat=feats["patch_tokens_flat"],
-            attn_weights=feats.get("attn_cls_to_patches"),
-            return_local=return_local,
-        )
+        # Run backbone + aggregator in full precision to avoid fp16 overflow/NANs
+        with amp.autocast(device_type="cuda", enabled=False):
+            feats = self.backbone.get_features_from_images(images, output_attentions=True)
+            agg_out = self.aggregator(
+                cls=feats["cls"],
+                patch_tokens_flat=feats["patch_tokens_flat"],
+                attn_weights=feats.get("attn_cls_to_patches"),
+                return_local=return_local,
+            )
         if return_local:
             descriptor, local = agg_out
             feats["local_descriptor"] = local
@@ -375,11 +382,13 @@ class CEDModel(nn.Module):
         q_images: torch.Tensor,
         r_images: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        q_feats = self.backbone.get_features_from_images(q_images)
-        r_feats = self.backbone.get_features_from_images(r_images)
-        q_tokens = q_feats["patch_tokens_flat"]
-        r_tokens = r_feats["patch_tokens_flat"]
-        logits = self.classifier(q_tokens, r_tokens).squeeze(-1)
+        # Also keep classification backbone path stable
+        with amp.autocast(device_type="cuda", enabled=False):
+            q_feats = self.backbone.get_features_from_images(q_images)
+            r_feats = self.backbone.get_features_from_images(r_images)
+            q_tokens = q_feats["patch_tokens_flat"]
+            r_tokens = r_feats["patch_tokens_flat"]
+            logits = self.classifier(q_tokens, r_tokens).squeeze(-1)
         return logits, q_feats, r_feats
 
 
@@ -407,39 +416,44 @@ def make_positive_negative_pairs(batch_imgs: torch.Tensor) -> Tuple[torch.Tensor
 
 
 def nt_xent_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.2) -> torch.Tensor:
-    # Force FP32 for numeric stability
+    """
+    NT-Xent (SimCLR) loss with safe float32 math.
+    """
     z1 = F.normalize(z1.float(), dim=-1)
     z2 = F.normalize(z2.float(), dim=-1)
-    reps = torch.cat([z1, z2], dim=0)
-    sim = reps @ reps.t()
-    sim = sim / temperature
-    sim = sim.float()
-    mask = torch.eye(sim.size(0), dtype=torch.bool, device=sim.device)
-    fill_value = torch.finfo(sim.dtype).min
-    sim.masked_fill_(mask, float(fill_value))
+
+    reps = torch.cat([z1, z2], dim=0)  # [2B, D]
+    sim = reps @ reps.t() / temperature  # [2B, 2B]
+
+    diag_mask = torch.eye(sim.size(0), dtype=torch.bool, device=sim.device)
+    sim = sim.masked_fill(diag_mask, -1e4)
+
     batch_size = z1.size(0)
     targets = torch.arange(batch_size, 2 * batch_size, device=sim.device)
-    targets = torch.cat([targets, torch.arange(0, batch_size, device=sim.device)])
+    targets = torch.cat([targets, torch.arange(0, batch_size, device=sim.device)], dim=0)
+
     loss = F.cross_entropy(sim, targets)
     return loss
 
 
 def similarity_kl_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
-    # FP32 for stability
+    """
+    Symmetric KL between similarity distributions, with stable log_softmax.
+    """
     z1 = F.normalize(z1.float(), dim=-1)
     z2 = F.normalize(z2.float(), dim=-1)
+
     sim1 = z1 @ z1.t() / temperature
     sim2 = z2 @ z2.t() / temperature
-    sim1 = sim1.float()
-    sim2 = sim2.float()
-    mask = torch.eye(sim1.size(0), dtype=torch.bool, device=sim1.device)
-    fill_value = torch.finfo(sim1.dtype).min
-    sim1.masked_fill_(mask, float(fill_value))
-    sim2.masked_fill_(mask, float(fill_value))
-    p1 = F.softmax(sim1, dim=-1)
-    p2 = F.softmax(sim2, dim=-1)
-    kl1 = F.kl_div(p1.log(), p2, reduction="batchmean")
-    kl2 = F.kl_div(p2.log(), p1, reduction="batchmean")
+
+    log_p1 = F.log_softmax(sim1, dim=-1)
+    log_p2 = F.log_softmax(sim2, dim=-1)
+    p1 = log_p1.exp()
+    p2 = log_p2.exp()
+
+    kl1 = F.kl_div(log_p1, p2, reduction="batchmean", log_target=False)
+    kl2 = F.kl_div(log_p2, p1, reduction="batchmean", log_target=False)
+
     return 0.5 * (kl1 + kl2)
 
 
@@ -447,38 +461,44 @@ def multi_similarity_loss(
     embeddings: torch.Tensor,
     labels: torch.Tensor,
     alpha: float = 2.0,
-    beta: float = 20.0,  # slightly softer than 50 for stability
+    beta: float = 50.0,
     margin: float = 0.5,
 ) -> torch.Tensor:
+    """
+    Multi-similarity loss in float32.
+    """
     if embeddings.size(0) < 2:
         return torch.tensor(0.0, device=embeddings.device)
 
-    embeddings = embeddings.float()
-    sims = F.normalize(embeddings, dim=-1) @ F.normalize(embeddings, dim=-1).t()
-    loss = torch.zeros(1, device=embeddings.device)
+    emb = F.normalize(embeddings.float(), dim=-1)
+    sims = emb @ emb.t()
+    loss = torch.zeros(1, device=embeddings.device, dtype=torch.float32)
     valid = 0
 
-    for i in range(embeddings.size(0)):
+    for i in range(emb.size(0)):
         pos_mask = (labels == labels[i]).clone()
         pos_mask[i] = False
         neg_mask = labels != labels[i]
+
         pos_sims = sims[i][pos_mask]
         neg_sims = sims[i][neg_mask]
+
         if pos_sims.numel() == 0 or neg_sims.numel() == 0:
             continue
 
-        # Clamp exponents to avoid overflow
         pos_term = (1.0 / alpha) * torch.log1p(
-            torch.sum(torch.exp(torch.clamp(-alpha * (pos_sims - (1 - margin)), max=20.0)))
+            torch.sum(torch.exp(torch.clamp(-alpha * (pos_sims - (1 - margin)), max=50.0)))
         )
         neg_term = (1.0 / beta) * torch.log1p(
-            torch.sum(torch.exp(torch.clamp(beta * (neg_sims - margin), max=20.0)))
+            torch.sum(torch.exp(torch.clamp(beta * (neg_sims - margin), max=50.0)))
         )
+
         loss = loss + pos_term + neg_term
         valid += 1
 
     if valid == 0:
         return torch.tensor(0.0, device=embeddings.device)
+
     return loss / valid
 
 
@@ -488,17 +508,20 @@ def asl_loss(
     lambda_mtr: float = 1.0,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    # FP32 for stability
-    v_former = v_former.float()
-    v_latter = v_latter.float()
+    """
+    ASL loss: norm ratio + metric term (NT-Xent).
+    """
+    vf = v_former.float()
+    vl = v_latter.float()
 
-    norm_f = v_former.norm(p=2, dim=-1)
-    norm_l = v_latter.norm(p=2, dim=-1)
+    norm_f = vf.norm(p=2, dim=-1)
+    norm_l = vl.norm(p=2, dim=-1)
     ratio = (norm_l + eps) / (norm_f + eps)
-    # Clamp ratio to avoid huge exp()
+
     ratio = torch.clamp(ratio, 0.1, 10.0)
     loss_ratio = torch.exp(1.0 - ratio).mean()
-    loss_metric = nt_xent_loss(v_former, v_latter)
+
+    loss_metric = nt_xent_loss(vf, vl, temperature=0.2)
     return loss_ratio + lambda_mtr * loss_metric
 
 
@@ -537,7 +560,6 @@ def load_checkpoint_if_available(
 ) -> Dict:
     """
     If checkpoint exists, load model, optimizer, and training_state.
-    Returns updated training_state dict.
     """
     if not os.path.exists(path):
         if rank == 0:
@@ -563,12 +585,9 @@ def load_checkpoint_if_available(
 
 
 # ======================================================================
-# Ground-truth helpers for DISC21 + NDEC (for eval_utils.evaluate_retrieval)
+# Ground-truth helpers for DISC21 + NDEC
 # ======================================================================
 def load_disc21_groundtruth_map(split: str, root: Path) -> Dict[str, List[str]]:
-    """
-    Build query_id -> [reference_id, ...] map from DISC21 CSV.
-    """
     df = load_groundtruth(split=split, root=root)
     gt: Dict[str, List[str]] = {}
     for row in df.itertuples():
@@ -614,9 +633,18 @@ def main():
 
     rank, world_size, local_rank = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")
+    cudnn.benchmark = True
+
+    # AMP scaler: handle both legacy (device) and newer (device_type) signatures
+    scaler_kwargs = {"enabled": True}
+    scaler_params = inspect.signature(amp.GradScaler).parameters
+    if "device_type" in scaler_params:
+        scaler_kwargs["device_type"] = "cuda"
+    elif "device" in scaler_params:
+        scaler_kwargs["device"] = "cuda"
+    scaler = amp.GradScaler(**scaler_kwargs)
 
     cfg = ExperimentConfig()
-    ndec_cfg = NdecConfig()
     if rank == 0:
         print("Config:", cfg)
         print(f"World size: {world_size} | Rank: {rank} | Local rank: {local_rank}")
@@ -646,15 +674,6 @@ def main():
         num_workers=cfg.num_workers,
     )
 
-    ndec_data_cfg = NdecConfig(
-        root=ndec_cfg.root,
-        img_size_train=ndec_cfg.img_size_train,
-        img_size_eval=ndec_cfg.img_size_eval,
-        batch_size_pairs=ndec_cfg.batch_size_pairs,
-        batch_size_eval=ndec_cfg.batch_size_eval,
-        num_workers=ndec_cfg.num_workers,
-    )
-
     train_tfms, eval_tfms = build_transforms(
         img_size_train=cfg.img_size_train,
         img_size_eval=cfg.img_size_eval,
@@ -666,12 +685,22 @@ def main():
     # DDP: distributed sampler for training
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
 
+    # Dynamically choose num_workers for loaders
+    cpu_count = os.cpu_count() or 8
+    num_workers = min(16, max(4, cpu_count // max(world_size, 1)))
+
+    if rank == 0:
+        print(f"[DataLoader] Using num_workers={num_workers}, prefetch_factor=2, persistent_workers=True")
+        sys.stdout.flush()
+
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size_train,
         sampler=train_sampler,
-        num_workers=cfg.num_workers,
+        num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
     )
 
     # DISC21 eval datasets (used only on rank 0)
@@ -684,42 +713,63 @@ def main():
             ref_ds,
             batch_size=cfg.batch_size_eval,
             shuffle=False,
-            num_workers=cfg.num_workers,
+            num_workers=num_workers,
             pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2,
         )
         dev_query_loader = DataLoader(
             dev_queries_ds,
             batch_size=cfg.batch_size_eval,
             shuffle=False,
-            num_workers=cfg.num_workers,
+            num_workers=num_workers,
             pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2,
         )
         test_query_loader = DataLoader(
             test_queries_ds,
             batch_size=cfg.batch_size_eval,
             shuffle=False,
-            num_workers=cfg.num_workers,
+            num_workers=num_workers,
             pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2,
         )
     else:
         ref_loader = dev_query_loader = test_query_loader = None  # type: ignore
 
-    # NDEC loaders (query, ref, pos, neg)
+    # ---------- NDEC config + loaders ----------
+    ndec_cfg = NdecDataConfig()
+    if hasattr(ndec_cfg, "root"):
+        ndec_cfg.root = cfg.ndec_root
+    if hasattr(ndec_cfg, "img_size_train"):
+        ndec_cfg.img_size_train = cfg.img_size_train
+    if hasattr(ndec_cfg, "img_size_eval"):
+        ndec_cfg.img_size_eval = cfg.img_size_eval
+    if hasattr(ndec_cfg, "batch_size_pairs"):
+        ndec_cfg.batch_size_pairs = cfg.batch_size_pairs
+    if hasattr(ndec_cfg, "batch_size_eval"):
+        ndec_cfg.batch_size_eval = cfg.batch_size_eval
+    if hasattr(ndec_cfg, "num_workers"):
+        ndec_cfg.num_workers = cfg.num_workers
+
     ndec_query_loader, ndec_ref_loader, ndec_pos_pair_loader, ndec_neg_pair_loader = build_ndec_loaders(
-        ndec_data_cfg
+        ndec_cfg
     )
 
-    # Create a DDP-aware loader for NDEC negative pairs (ASL stage)
     ndec_neg_dataset = ndec_neg_pair_loader.dataset
     ndec_neg_sampler = DistributedSampler(
         ndec_neg_dataset, num_replicas=world_size, rank=rank, shuffle=True
     )
     ndec_neg_train_loader = DataLoader(
         ndec_neg_dataset,
-        batch_size=ndec_data_cfg.batch_size_pairs,
+        batch_size=ndec_neg_pair_loader.batch_size,
         sampler=ndec_neg_sampler,
-        num_workers=ndec_data_cfg.num_workers,
+        num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
     )
 
     if rank == 0:
@@ -751,7 +801,6 @@ def main():
     )
 
     # ------------------ training state (for resume) ------------------
-    # Defaults if no checkpoint exists
     training_state = {
         "epoch_disc21": 0,
         "epoch_ndec": 0,
@@ -763,7 +812,6 @@ def main():
         "ndec_losses": [],
     }
 
-    # Try to load checkpoint (if exists) and update training_state
     training_state = load_checkpoint_if_available(
         ddp_model.module, optimizer, checkpoint_path, rank, training_state
     )
@@ -779,10 +827,9 @@ def main():
 
     # ------------------ training flags ------------------
     should_train_disc21 = True
-    should_train_ndec = True  # NDEC ASL stage uses DDP on all ranks
+    should_train_ndec = True
     did_train = False
 
-    # If we've already reached/exceeded the max epochs, skip that stage
     if start_epoch_disc21 >= cfg.num_epochs_disc21:
         should_train_disc21 = False
         if rank == 0:
@@ -820,59 +867,110 @@ def main():
 
                 optimizer.zero_grad(set_to_none=True)
 
-                # encode anchor & positive
-                v_anchor, feats_anchor = ddp_model.module.encode_images(x_anchor, return_local=True)
-                v_pos, feats_pos = ddp_model.module.encode_images(x_pos, return_local=True)
+                # forward + loss with AMP autocast
+                with amp.autocast(device_type="cuda", dtype=torch.float16):
+                    # encode anchor & positive (internally forced to fp32)
+                    v_anchor, feats_anchor = ddp_model.module.encode_images(x_anchor, return_local=True)
+                    v_pos, feats_pos = ddp_model.module.encode_images(x_pos, return_local=True)
 
-                loss_contrast = nt_xent_loss(v_anchor, v_pos, temperature=cfg.temperature_ntxent)
-                loss_kl = similarity_kl_loss(v_anchor, v_pos, temperature=cfg.temperature_kl)
+                    # OPTIONAL: temporary sanity check
+                    if not torch.isfinite(v_anchor).all() or not torch.isfinite(v_pos).all():
+                        if rank == 0:
+                            print(
+                                "[SANITY] Backbone output has non-finite values. "
+                                f"v_anchor finite={torch.isfinite(v_anchor).all().item()}, "
+                                f"v_pos finite={torch.isfinite(v_pos).all().item()}"
+                            )
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
 
-                local_anchor = feats_anchor.get("local_descriptor")
-                local_pos = feats_pos.get("local_descriptor")
-                local_embeddings = torch.cat([local_anchor, local_pos], dim=0)
-                batch_ids = torch.arange(local_anchor.size(0), device=local_anchor.device)
-                local_labels = torch.cat([batch_ids, batch_ids], dim=0)
-                loss_local = multi_similarity_loss(local_embeddings, local_labels)
+                    loss_contrast = nt_xent_loss(v_anchor, v_pos, temperature=cfg.temperature_ntxent)
+                    loss_kl = similarity_kl_loss(v_anchor, v_pos, temperature=cfg.temperature_kl)
 
-                anchor_tokens = feats_anchor["patch_tokens_flat"].detach()
-                pos_tokens = feats_pos["patch_tokens_flat"].detach()
+                    local_anchor = feats_anchor.get("local_descriptor")
+                    local_pos = feats_pos.get("local_descriptor")
+                    local_embeddings = torch.cat([local_anchor, local_pos], dim=0)
+                    batch_ids = torch.arange(local_anchor.size(0), device=local_anchor.device)
+                    local_labels = torch.cat([batch_ids, batch_ids], dim=0)
+                    loss_local = multi_similarity_loss(local_embeddings, local_labels)
 
-                with torch.no_grad():
-                    neg_feats = ddp_model.module.backbone.get_features_from_images(x_neg)
-                neg_tokens = neg_feats["patch_tokens_flat"].detach()
+                    anchor_tokens = feats_anchor["patch_tokens_flat"].detach()
+                    pos_tokens = feats_pos["patch_tokens_flat"].detach()
 
-                logits_pos = ddp_model.module.classifier(anchor_tokens, pos_tokens).squeeze(-1)
-                logits_neg = ddp_model.module.classifier(anchor_tokens, neg_tokens).squeeze(-1)
+                    with amp.autocast(device_type="cuda", enabled=False):
+                        with torch.no_grad():
+                            neg_feats = ddp_model.module.backbone.get_features_from_images(x_neg)
+                        neg_tokens = neg_feats["patch_tokens_flat"].detach()
+                        logits_pos = ddp_model.module.classifier(anchor_tokens, pos_tokens).squeeze(-1)
+                        logits_neg = ddp_model.module.classifier(anchor_tokens, neg_tokens).squeeze(-1)
 
-                labels_pos = torch.ones_like(logits_pos)
-                labels_neg = torch.zeros_like(logits_neg)
-                logits = torch.cat([logits_pos, logits_neg], dim=0)
-                labels = torch.cat([labels_pos, labels_neg], dim=0)
-                loss_bce = bce_loss(logits, labels)
+                    labels_pos = torch.ones_like(logits_pos)
+                    labels_neg = torch.zeros_like(logits_neg)
+                    logits = torch.cat([logits_pos, logits_neg], dim=0)
+                    labels = torch.cat([labels_pos, labels_neg], dim=0)
 
-                loss = (
-                    loss_contrast
-                    + cfg.lambda_kl * loss_kl
-                    + cfg.lambda_local * loss_local
-                    + cfg.lambda_bce * loss_bce
-                )
+                    loss_bce = bce_loss(logits.float(), labels.float())
 
-                # NaN / inf guard
+                    loss = (
+                        loss_contrast
+                        + cfg.lambda_kl * loss_kl
+                        + cfg.lambda_local * loss_local
+                        + cfg.lambda_bce * loss_bce
+                    )
+
+                # NaN / inf guard with debug
                 if not torch.isfinite(loss):
                     if rank == 0:
+                        def finite(t):
+                            return bool(torch.isfinite(t).all().item())
+
                         print("[WARN][DISC21] Non-finite loss encountered; skipping batch.")
+                        print(
+                            "  components finite?:",
+                            f"contrast={finite(loss_contrast)},",
+                            f"kl={finite(loss_kl)},",
+                            f"local={finite(loss_local)},",
+                            f"bce={finite(loss_bce)}",
+                        )
+                        try:
+                            print("  loss_contrast:", float(loss_contrast.detach().cpu()))
+                            print("  loss_kl      :", float(loss_kl.detach().cpu()))
+                            print("  loss_local   :", float(loss_local.detach().cpu()))
+                            print("  loss_bce     :", float(loss_bce.detach().cpu()))
+                        except Exception as e:
+                            print("  [DEBUG] error printing loss components:", e)
+
+                        for name, t in [
+                            ("v_anchor", v_anchor),
+                            ("v_pos", v_pos),
+                            ("local_anchor", local_anchor),
+                            ("local_pos", local_pos),
+                            ("logits_pos", logits_pos),
+                            ("logits_neg", logits_neg),
+                        ]:
+                            if not torch.isfinite(t).all():
+                                finite_vals = t[torch.isfinite(t)]
+                                if finite_vals.numel() > 0:
+                                    t_min = float(finite_vals.min().detach().cpu())
+                                    t_max = float(finite_vals.max().detach().cpu())
+                                else:
+                                    t_min = float("nan")
+                                    t_max = float("nan")
+                                print(f"  [DEBUG] {name} has non-finite values. min={t_min}, max={t_max}")
                     optimizer.zero_grad(set_to_none=True)
                     continue
 
-                loss.backward()
+                # Backward with AMP
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), max_norm=1.0)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
 
-                # tracking
-                epoch_loss += loss.item()
+                epoch_loss += float(loss.detach().cpu())
 
                 with torch.no_grad():
-                    preds = (torch.sigmoid(logits) >= 0.5).float()
+                    preds = (torch.sigmoid(logits.float()) >= 0.5).float()
                     correct = (preds == labels).sum().item()
                     total = labels.numel()
                     epoch_correct += correct
@@ -882,7 +980,7 @@ def main():
                     batch_acc = correct / max(total, 1)
                     progress.set_postfix(
                         {
-                            "loss": f"{loss.item():.4f}",
+                            "loss": f"{float(loss.detach().cpu()):.4f}",
                             "contrast": f"{loss_contrast.item():.4f}",
                             "local": f"{loss_local.item():.4f}",
                             "bce_acc": f"{batch_acc:.3f}",
@@ -894,7 +992,6 @@ def main():
             dist.all_reduce(epoch_loss_tensor, op=dist.ReduceOp.SUM)
             epoch_loss_avg = epoch_loss_tensor.item() / world_size / max(len(train_loader), 1)
 
-            # Accuracy across processes (sample-weighted)
             correct_tensor = torch.tensor(epoch_correct, device=device)
             total_tensor = torch.tensor(epoch_total, device=device)
             dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
@@ -903,7 +1000,6 @@ def main():
                 (correct_tensor.item() / max(total_tensor.item(), 1.0)) if total_tensor.item() > 0 else 0.0
             )
 
-            # Early stopping logic + checkpointing (rank 0), then sync stop flag
             stop_now = False
             if rank == 0:
                 disc21_losses.append(epoch_loss_avg)
@@ -920,7 +1016,6 @@ def main():
                 else:
                     disc21_bad_epochs += 1
 
-                # update training_state and save checkpoint every epoch
                 training_state["epoch_disc21"] = current_epoch
                 training_state["best_disc21_loss"] = best_disc21_loss
                 training_state["disc21_bad_epochs"] = disc21_bad_epochs
@@ -941,7 +1036,6 @@ def main():
                         f"to satisfy min_epochs_disc21."
                     )
 
-            # Broadcast stop flag so all ranks break together
             stop_tensor = torch.tensor(1 if stop_now else 0, device=device)
             dist.broadcast(stop_tensor, src=0)
             if stop_tensor.item() == 1:
@@ -979,33 +1073,33 @@ def main():
 
                 optimizer.zero_grad(set_to_none=True)
 
-                v_former, _ = ddp_model.module.encode_images(img_a)
-                v_latter, _ = ddp_model.module.encode_images(img_b)
+                with amp.autocast(device_type="cuda", dtype=torch.float16):
+                    v_former, _ = ddp_model.module.encode_images(img_a)
+                    v_latter, _ = ddp_model.module.encode_images(img_b)
 
-                loss_asl = asl_loss(v_former=v_former, v_latter=v_latter, lambda_mtr=cfg.lambda_asl_mtr)
+                    loss_asl = asl_loss(v_former=v_former, v_latter=v_latter, lambda_mtr=cfg.lambda_asl_mtr)
 
-                # NaN / inf guard
                 if not torch.isfinite(loss_asl):
                     if rank == 0:
                         print("[WARN][NDEC] Non-finite ASL loss encountered; skipping batch.")
                     optimizer.zero_grad(set_to_none=True)
                     continue
 
-                loss_asl.backward()
+                scaler.scale(loss_asl).backward()
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), max_norm=1.0)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
 
-                total_loss += loss_asl.item()
+                total_loss += float(loss_asl.detach().cpu())
 
                 if rank == 0:
-                    progress.set_postfix({"asl_loss": f"{loss_asl.item():.4f}"})
+                    progress.set_postfix({"asl_loss": f"{float(loss_asl.detach().cpu()):.4f}"})
 
-            # Average ASL loss across ranks
             loss_tensor = torch.tensor(total_loss, device=device)
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
             avg_asl_global = loss_tensor.item() / world_size / max(len(ndec_neg_train_loader), 1)
 
-            # Early stopping logic + checkpoint (rank 0), then sync stop flag
             stop_now_ndec = False
             if rank == 0:
                 ndec_losses.append(avg_asl_global)
@@ -1067,7 +1161,6 @@ def main():
 
         eval_model = ddp_model.module  # unwrap CEDModel
 
-        # ---- DISC21: compute reference descriptors once ----
         disc_ref_vecs, disc_ref_ids = compute_descriptors_for_loader(
             ref_loader, eval_model, str((script_dir / "artifacts/disc21_ref").resolve())
         )
@@ -1092,7 +1185,6 @@ def main():
             print(f"[Eval][DISC21-{split_name}] metrics:", metrics)
             sys.stdout.flush()
 
-        # ---- NDEC retrieval metrics ----
         print("\n[Eval][NDEC] Encoding references + queries...")
         sys.stdout.flush()
 
@@ -1102,7 +1194,7 @@ def main():
         ndec_query_vecs, ndec_query_ids = compute_descriptors_for_loader(
             ndec_query_loader, eval_model, str((script_dir / "artifacts/ndec_query").resolve())
         )
-        ndec_gt_map = load_ndec_groundtruth_map(ndec_cfg.root, drop_missing=True)
+        ndec_gt_map = load_ndec_groundtruth_map(cfg.ndec_root, drop_missing=True)
 
         ndec_metrics = evaluate_retrieval(
             query_vecs=ndec_query_vecs,
