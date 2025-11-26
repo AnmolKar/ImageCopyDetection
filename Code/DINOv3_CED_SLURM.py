@@ -25,7 +25,14 @@ if str(code_dir) not in sys.path:
 else:
     print(f"Using existing sys.path entry: {code_dir}")
 
-from disc21_loader import (
+from Utilities.eval_utils import (
+    compute_descriptors_for_loader,
+    compute_descriptors_for_loader_tta,
+    evaluate_retrieval,
+    benchmark_inference,
+)
+
+from Utilities.disc21_loader import (
     Disc21DataConfig,
     build_transforms,
     get_train_dataset,
@@ -36,13 +43,15 @@ from disc21_loader import (
     load_groundtruth,
 )
 
-from ndec_loader import (
+from Utilities.ndec_loader import (
     NdecDataConfig,
     build_default_loaders as build_ndec_loaders,
     load_groundtruth as load_ndec_groundtruth,
 )
 
-# %%
+# ------------------------------------------------------------------
+# Auth / device
+# ------------------------------------------------------------------
 env_path = Path(__file__).resolve().parent / ".env"
 if env_path.exists():
     load_dotenv(env_path)
@@ -56,9 +65,11 @@ else:
     login()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 print("Using device:", device)
 
+# ------------------------------------------------------------------
+# Configs
+# ------------------------------------------------------------------
 @dataclass
 class ExperimentConfig:
     disc21_root: Path = Path("/home/jowatson/Deep Learning/DISC21")
@@ -97,6 +108,7 @@ class NdecConfig:
     batch_size_eval: int = 64
     num_workers: int = 4
 
+
 cfg = ExperimentConfig()
 print(cfg)
 
@@ -107,7 +119,7 @@ disc_cfg = Disc21DataConfig(
     batch_size_train=cfg.batch_size_train,
     batch_size_eval=cfg.batch_size_eval,
     num_workers=cfg.num_workers,
- )
+)
 
 ndec_cfg = NdecConfig(root=cfg.ndec_root)
 
@@ -118,12 +130,15 @@ ndec_data_cfg = NdecDataConfig(
     batch_size_pairs=ndec_cfg.batch_size_pairs,
     batch_size_eval=ndec_cfg.batch_size_eval,
     num_workers=ndec_cfg.num_workers,
- )
+)
 
+# ------------------------------------------------------------------
+# Datasets / loaders
+# ------------------------------------------------------------------
 train_tfms, eval_tfms = build_transforms(
     img_size_train=cfg.img_size_train,
     img_size_eval=cfg.img_size_eval,
- )
+)
 
 train_ds = get_train_dataset(root=disc_cfg.root, transform=train_tfms)
 ref_ds = get_reference_dataset(root=disc_cfg.root, transform=eval_tfms)
@@ -132,27 +147,27 @@ dev_queries_ds = get_query_dataset(
     "dev",
     root=disc_cfg.root,
     transform=eval_tfms,
- )
+)
 
 test_queries_ds = get_query_dataset(
     "test",
     root=disc_cfg.root,
     transform=eval_tfms,
- )
+)
 
 dev_pairs_ds = get_pair_dataset(
     "dev",
     root=disc_cfg.root,
     transform_query=eval_tfms,
     transform_reference=eval_tfms,
- )
+)
 
 test_pairs_ds = get_pair_dataset(
     "test",
     root=disc_cfg.root,
     transform_query=eval_tfms,
     transform_reference=eval_tfms,
- )
+)
 
 train_loader = create_dataloader(
     train_ds,
@@ -160,7 +175,7 @@ train_loader = create_dataloader(
     shuffle=True,
     num_workers=cfg.num_workers,
     pin_memory=True,
- )
+)
 
 ref_loader = create_dataloader(
     ref_ds,
@@ -168,7 +183,7 @@ ref_loader = create_dataloader(
     shuffle=False,
     num_workers=cfg.num_workers,
     pin_memory=True,
- )
+)
 
 dev_query_loader = create_dataloader(
     dev_queries_ds,
@@ -176,7 +191,7 @@ dev_query_loader = create_dataloader(
     shuffle=False,
     num_workers=cfg.num_workers,
     pin_memory=True,
- )
+)
 
 test_query_loader = create_dataloader(
     test_queries_ds,
@@ -184,7 +199,7 @@ test_query_loader = create_dataloader(
     shuffle=False,
     num_workers=cfg.num_workers,
     pin_memory=True,
- )
+)
 
 dev_loader = create_dataloader(
     dev_pairs_ds,
@@ -192,7 +207,7 @@ dev_loader = create_dataloader(
     shuffle=False,
     num_workers=cfg.num_workers,
     pin_memory=True,
- )
+)
 
 test_loader = create_dataloader(
     test_pairs_ds,
@@ -200,29 +215,25 @@ test_loader = create_dataloader(
     shuffle=False,
     num_workers=cfg.num_workers,
     pin_memory=True,
- )
+)
 
 ndec_query_loader, ndec_ref_loader, ndec_pos_pair_loader, ndec_neg_pair_loader = build_ndec_loaders(
     ndec_data_cfg
- )
+)
 
 print(
     f"Train images: {len(train_ds):,} | References: {len(ref_ds):,} | "
     f"Dev queries: {len(dev_queries_ds):,} | Test queries: {len(test_queries_ds):,} | "
     f"Dev pairs: {len(dev_pairs_ds):,} | Test pairs: {len(test_pairs_ds):,}"
- )
+)
 
-# %% [markdown]
-# # DINOv3 Backbone Wrapper (ViT-B/16)
-# 
-# Wrap Hugging Face's ViT-B/16 DINOv3 checkpoint so downstream modules can request normalized CLS, register, and patch tokens without worrying about preprocessing logistics.
-
-# %%
+# ------------------------------------------------------------------
+# DINOv3 Backbone Wrapper (ViT-B/16)
+# ------------------------------------------------------------------
 class DinoV3Backbone(nn.Module):
+    """Wrapper that exposes token-level DINOv3 activations."""
 
-    """ Wrapper that exposes token-level DINOv3 activations."""
     def __init__(self, model_name: str = cfg.model_name):
-
         super().__init__()
         dtype = torch.float16 if device.type == "cuda" else torch.float32
 
@@ -244,20 +255,15 @@ class DinoV3Backbone(nn.Module):
             return AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 
     @torch.inference_mode()
-
     def preprocess(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Convert float tensors in [0,1] into pixel values expected by the HF model."""
-
         images_np = [img.detach().cpu().permute(1, 2, 0).numpy() for img in images]
         encoded = self.processor(images=images_np, return_tensors="pt")
         encoded = {k: v.to(device) for k, v in encoded.items()}
         return encoded
 
-
-
     def forward(self, pixel_values: torch.Tensor, output_attentions: bool = False) -> Dict[str, torch.Tensor]:
         """Run the ViT and return a dictionary of relevant token tensors."""
-
         if output_attentions and self._supports_attn_impl and not self._attn_impl_is_eager:
             try:
                 self.model.set_attn_implementation("eager")
@@ -294,7 +300,6 @@ class DinoV3Backbone(nn.Module):
             attn_grid = attn_weights.view(B, h_p, w_p)
 
         return {
-
             "cls": cls_token,
             "patch_tokens": patch_tokens,
             "patch_tokens_flat": patch_tokens_flat,
@@ -303,49 +308,36 @@ class DinoV3Backbone(nn.Module):
             "attentions": outputs.attentions if output_attentions else None,
         }
 
-
-
     def get_features_from_images(self, images: torch.Tensor, output_attentions: bool = False) -> Dict[str, torch.Tensor]:
-
         """Preprocess raw images then run a forward pass in one call."""
         encoded = self.preprocess(images)
         return self.forward(encoded["pixel_values"], output_attentions=output_attentions)
 
-# %%
+
 backbone = DinoV3Backbone(model_name=cfg.model_name)
 
-
-
+# quick smoke test
 try:
-
     sample_imgs, sample_ids = next(iter(train_loader))
     sample_imgs = sample_imgs[:2].to(device)  # keep it light for smoke test
-
     with torch.no_grad():
         feats = backbone.get_features_from_images(sample_imgs)
-
     print(
         "CLS:", feats["cls"].shape,
         "| Patch grid:", feats["patch_tokens"].shape,
         "| Flat patches:", feats["patch_tokens_flat"].shape,
     )
-
 except StopIteration:
     print("Train loader is empty—please verify DISC21 data paths.")
 
-# %% [markdown]
-# # CED-style Feature Aggregation (Global + Local)
-# 
-# Aggregate CLS and spatial patch descriptors into a compact CED vector via GeM pooling, emulating the original copy-edit detector's global/local fusion.
-
-# %%
+# ------------------------------------------------------------------
+# CED-style Feature Aggregation (Global + Local)
+# ------------------------------------------------------------------
 class CEDFeatureAggregator(nn.Module):
     """Fuse CLS tokens with pooled local descriptors to mimic CED embeddings."""
 
     def __init__(self, dim: int, gem_p: float = 3.0, use_proj: bool = True):
-
         super().__init__()
-
         self.dim = dim
         self.gem_p = gem_p
         self.use_proj = use_proj
@@ -353,23 +345,21 @@ class CEDFeatureAggregator(nn.Module):
         if use_proj:
             self.proj_cls = nn.Linear(dim, dim)
             self.proj_loc = nn.Linear(dim, dim)
-
         else:
             self.proj_cls = nn.Identity()
             self.proj_loc = nn.Identity()
 
     @staticmethod
-
     def gem(x: torch.Tensor, p: float = 3.0, eps: float = 1e-6) -> torch.Tensor:
         """Generalized mean pooling over the sequence dimension."""
-
         x = x.clamp(min=eps).pow(p)
         x = x.mean(dim=1)
-
         return x.pow(1.0 / p)
 
     def compute_local_embedding(
-        self, patch_tokens_flat: torch.Tensor, attn_weights: Optional[torch.Tensor] = None
+        self,
+        patch_tokens_flat: torch.Tensor,
+        attn_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Return the normalized local descriptor after optional attention weighting."""
         weighted_tokens = patch_tokens_flat
@@ -383,8 +373,6 @@ class CEDFeatureAggregator(nn.Module):
         local = self.proj_loc(local)
         return F.normalize(local, dim=-1)
 
-
-
     def forward(
         self,
         cls: torch.Tensor,
@@ -393,7 +381,6 @@ class CEDFeatureAggregator(nn.Module):
         return_local: bool = False,
     ) -> torch.Tensor:
         """Return a concatenated, L2-normalized descriptor (global + local)."""
-
         cls_global = self.proj_cls(cls)
         cls_global = F.normalize(cls_global, dim=-1)
         local = self.compute_local_embedding(patch_tokens_flat, attn_weights=attn_weights)
@@ -402,10 +389,9 @@ class CEDFeatureAggregator(nn.Module):
 
         if return_local:
             return descriptor, local
-
         return descriptor
 
-# %%
+
 backbone_dtype = next(backbone.parameters()).dtype
 aggregator = CEDFeatureAggregator(dim=backbone.hidden_size, gem_p=3.0, use_proj=True)
 aggregator = aggregator.to(device=device, dtype=backbone_dtype)
@@ -413,28 +399,20 @@ aggregator = aggregator.to(device=device, dtype=backbone_dtype)
 if "feats" in locals():
     desc = aggregator(feats["cls"], feats["patch_tokens_flat"])
     print("CED descriptor shape:", desc.shape)
-
 else:
     print("No cached backbone features available for aggregation test.")
 
-# %% [markdown]
-# # Copy-Edit Classifier Head (Cross-Attention)
-# 
-# Model pairwise copy-edit likelihood with a lightweight cross-attention module that lets query tokens attend to reference tokens before global pooling.
-
-# %%
+# ------------------------------------------------------------------
+# Copy-Edit Classifier Head (Cross-Attention)
+# ------------------------------------------------------------------
 class TransformerBlock(nn.Module):
     """Minimal Transformer encoder block for token refinement."""
 
-
     def __init__(self, dim: int, num_heads: int = 8, mlp_ratio: float = 4.0, dropout: float = 0.1):
-
         super().__init__()
-
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
         self.norm2 = nn.LayerNorm(dim)
-
         self.mlp = nn.Sequential(
             nn.Linear(dim, int(dim * mlp_ratio)),
             nn.GELU(),
@@ -443,46 +421,31 @@ class TransformerBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_norm = self.norm1(x)
         attn_out, _ = self.attn(x_norm, x_norm, x_norm)
         x = x + attn_out
         x_norm = self.norm2(x)
         x = x + self.mlp(x_norm)
-
         return x
-
-
-
 
 
 class CopyEditClassifier(nn.Module):
     """Cross-attention head that predicts copy-edit likelihoods for query/reference pairs."""
 
-
     def __init__(self, dim: int, num_heads: int = 8, num_layers: int = 2, dropout: float = 0.1):
-
         super().__init__()
-
         self.cross_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
         self.blocks = nn.ModuleList(
             [TransformerBlock(dim, num_heads=num_heads, dropout=dropout) for _ in range(num_layers)]
         )
-
         self.norm = nn.LayerNorm(dim)
         self.head = nn.Linear(dim, 1)
 
-
-
     def forward(self, q_tokens: torch.Tensor, r_tokens: torch.Tensor) -> torch.Tensor:
-
         """Return logits for each query/reference pair."""
-
         q_norm = q_tokens
         r_norm = r_tokens
-
         cross_out, _ = self.cross_attn(q_norm, r_norm, r_norm)
         x = q_tokens + cross_out
         for block in self.blocks:
@@ -490,38 +453,28 @@ class CopyEditClassifier(nn.Module):
         x = self.norm(x)
         x = x.mean(dim=1)
         logits = self.head(x)
-
         return logits
 
 
-# %%
 classifier = CopyEditClassifier(dim=backbone.hidden_size)
 classifier = classifier.to(device=device, dtype=backbone_dtype)
 
 if "feats" in locals():
     q_tokens = feats["patch_tokens_flat"]
     r_tokens = feats["patch_tokens_flat"]
-
     logits = classifier(q_tokens, r_tokens)
-
     print("Classifier logits shape:", logits.shape)
 else:
-
     print("No backbone features cached yet for classifier sanity check.")
 
-# %% [markdown]
-# ## CED Model Wrapper
-# 
-# Bundle the backbone, aggregator, and classifier so training/eval code can call concise helper methods (`encode_images`, `score_pair`).
-
-# %%
+# ------------------------------------------------------------------
+# CED Model Wrapper
+# ------------------------------------------------------------------
 class CEDModel(nn.Module):
     """High-level wrapper orchestrating backbone encoding and pair scoring."""
 
     def __init__(self, backbone: DinoV3Backbone, dim: int):
-
         super().__init__()
-
         self.backbone = backbone
         model_dtype = next(self.backbone.parameters()).dtype
         self.aggregator = CEDFeatureAggregator(dim=dim, gem_p=3.0, use_proj=True)
@@ -530,7 +483,9 @@ class CEDModel(nn.Module):
         self.classifier = self.classifier.to(device=device, dtype=model_dtype)
 
     def encode_images(
-        self, images: torch.Tensor, return_local: bool = False
+        self,
+        images: torch.Tensor,
+        return_local: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         feats = self.backbone.get_features_from_images(
             images, output_attentions=True
@@ -546,28 +501,27 @@ class CEDModel(nn.Module):
             feats["local_descriptor"] = local
         else:
             descriptor = agg_out
-
         return descriptor, feats
 
-
-
-    def score_pair(self, q_images: torch.Tensor, r_images: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    def score_pair(
+        self,
+        q_images: torch.Tensor,
+        r_images: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         q_feats = self.backbone.get_features_from_images(q_images)
         r_feats = self.backbone.get_features_from_images(r_images)
         q_tokens = q_feats["patch_tokens_flat"]
         r_tokens = r_feats["patch_tokens_flat"]
         logits = self.classifier(q_tokens, r_tokens).squeeze(-1)
-
         return logits, q_feats, r_feats
 
-# %% [markdown]
-# # Self-Supervised Training Loop (DISC21)
-# 
-# Create synthetic copy-edits, apply the combined NT-Xent + KL + local multi-sim objectives, and fine-tune the backbone/heads jointly before introducing the classifier BCE term.
 
-# %%
+ced_model = CEDModel(backbone=backbone, dim=backbone.hidden_size).to(device)
+
+# ------------------------------------------------------------------
+# Self-Supervised Training (DISC21) + ASL Fine-tuning (NDEC)
+# ------------------------------------------------------------------
 copy_edit_aug = V.Compose(
-
     [
         V.RandomResizedCrop(cfg.img_size_train, scale=(0.6, 1.0)),
         V.RandomHorizontalFlip(),
@@ -576,23 +530,20 @@ copy_edit_aug = V.Compose(
     ]
 )
 
+
 def make_positive_negative_pairs(batch_imgs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Create anchor/positive/negative triplets via stochastic augmentations."""
-
     B = batch_imgs.size(0)
     imgs_cpu = batch_imgs.detach().cpu()
     x_anchor = batch_imgs.to(device)
     x_pos = torch.stack([copy_edit_aug(img) for img in imgs_cpu]).to(device)
     perm = torch.randperm(B)
     x_neg = torch.stack([copy_edit_aug(imgs_cpu[i]) for i in perm]).to(device)
-
     return x_anchor, x_pos, x_neg
-
 
 
 def nt_xent_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.2) -> torch.Tensor:
     """SimCLR-style NT-Xent contrastive loss over normalized embeddings."""
-
     z1 = F.normalize(z1, dim=-1)
     z2 = F.normalize(z2, dim=-1)
     reps = torch.cat([z1, z2], dim=0)
@@ -606,9 +557,7 @@ def nt_xent_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.2) -
     targets = torch.arange(batch_size, 2 * batch_size, device=sim.device)
     targets = torch.cat([targets, torch.arange(0, batch_size, device=sim.device)])
     loss = F.cross_entropy(sim, targets)
-
     return loss
-
 
 
 def similarity_kl_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
@@ -630,9 +579,12 @@ def similarity_kl_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 
     return 0.5 * (kl1 + kl2)
 
 
-
 def multi_similarity_loss(
-    embeddings: torch.Tensor, labels: torch.Tensor, alpha: float = 2.0, beta: float = 50.0, margin: float = 0.5
+    embeddings: torch.Tensor,
+    labels: torch.Tensor,
+    alpha: float = 2.0,
+    beta: float = 50.0,
+    margin: float = 0.5,
 ) -> torch.Tensor:
     """Multi-similarity loss on local descriptors within a batch."""
     if embeddings.size(0) < 2:
@@ -648,8 +600,12 @@ def multi_similarity_loss(
         neg_sims = sims[i][neg_mask]
         if pos_sims.numel() == 0 or neg_sims.numel() == 0:
             continue
-        pos_term = (1.0 / alpha) * torch.log1p(torch.sum(torch.exp(-alpha * (pos_sims - (1 - margin)))))
-        neg_term = (1.0 / beta) * torch.log1p(torch.sum(torch.exp(beta * (neg_sims - margin))))
+        pos_term = (1.0 / alpha) * torch.log1p(
+            torch.sum(torch.exp(-alpha * (pos_sims - (1 - margin))))
+        )
+        neg_term = (1.0 / beta) * torch.log1p(
+            torch.sum(torch.exp(beta * (neg_sims - margin)))
+        )
         loss = loss + pos_term + neg_term
         valid += 1
     if valid == 0:
@@ -657,9 +613,11 @@ def multi_similarity_loss(
     return loss / valid
 
 
-
 def asl_loss(
-    v_former: torch.Tensor, v_latter: torch.Tensor, lambda_mtr: float = 1.0, eps: float = 1e-6
+    v_former: torch.Tensor,
+    v_latter: torch.Tensor,
+    lambda_mtr: float = 1.0,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
     """Simplified ASL-style norm-ratio + metric alignment loss."""
     norm_f = v_former.norm(p=2, dim=-1)
@@ -672,57 +630,31 @@ def asl_loss(
 
 bce_loss = nn.BCEWithLogitsLoss()
 
-# %% [markdown]
-# ## Loss Breakdown (CEDetector Alignment)
-# 
-# - **Global contrast + KL**: NT-Xent enforces view consistency while symmetric KL aligns similarity distributions, mirroring CEDetector's global objective.
-# - **Local multi-sim**: GeM pooled locals use CLS attention weights so positives stay close and negatives push apart via multi-similarity mining.
-# - **Classifier BCE (stop-grad)**: Copy-edit head receives frozen backbone tokens so it regularizes head weights without disturbing the encoder.
-
-# %% [markdown]
-# ## ASL Fine-Tuning (NDEC Hard Negatives)
-# 
-# Hard mismatched pairs from NDEC drive an ASL-style loss that (1) enforces norm asymmetry between former/latter patches and (2) keeps their descriptors metrically aligned, echoing the ASL paper's formulation.
-
-# %%
-ced_model = CEDModel(backbone=backbone, dim=backbone.hidden_size).to(device)
-
 optimizer = torch.optim.AdamW(
-
     [
         {"params": ced_model.backbone.parameters(), "lr": cfg.lr_backbone},
-
         {
             "params": list(ced_model.aggregator.parameters())
             + list(ced_model.classifier.parameters()),
             "lr": cfg.lr_head,
         },
     ],
-
     weight_decay=cfg.weight_decay,
- )
+)
 
-
-
-should_train_disc21 = True  # flip to True to launch DISC21 self-supervised training
-should_train_ndec = True    # flip to True to run the NDEC ASL fine-tuning stage
-
+should_train_disc21 = True  # flip to False if you just want evaluation
+should_train_ndec = True    # flip to False to skip NDEC ASL stage
 did_train = False
 
-
-# %% [markdown]
-# # (Optional) Save/Load Checkpoints & Precomputed Embeddings
-#
-# Utility helpers to persist model weights and cached descriptors for faster experimentation across sessions.
-
-
+# ------------------------------------------------------------------
+# Checkpoint helpers
+# ------------------------------------------------------------------
 def save_checkpoint(model: CEDModel, optimizer: torch.optim.Optimizer, path: str):
     ckpt = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "config": cfg.__dict__,
     }
-
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(ckpt, path)
     print(f"Saved checkpoint to {path}")
@@ -731,30 +663,25 @@ def save_checkpoint(model: CEDModel, optimizer: torch.optim.Optimizer, path: str
 def load_checkpoint(model: CEDModel, optimizer: torch.optim.Optimizer, path: str):
     ckpt = torch.load(path, map_location=device)
     model.load_state_dict(ckpt["model"])
-
     if optimizer is not None and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])
-
     print(f"Restored checkpoint from {path}")
 
 
-
+# ------------------------------------------------------------------
+# Training loops
+# ------------------------------------------------------------------
 if should_train_disc21:
     did_train = True
-
     best_disc21_loss = float("inf")
     disc21_bad_epochs = 0
 
     for epoch in range(cfg.num_epochs_disc21):
-
         ced_model.train()
-
         total_loss = 0.0
-
         progress = tqdm(train_loader, desc=f"DISC21 Epoch {epoch + 1}/{cfg.num_epochs_disc21}")
 
         for imgs, _ in progress:
-
             x_anchor, x_pos, x_neg = make_positive_negative_pairs(imgs)
 
             optimizer.zero_grad()
@@ -774,9 +701,7 @@ if should_train_disc21:
             local_embeddings = torch.cat([local_anchor, local_pos], dim=0)
             batch_ids = torch.arange(local_anchor.size(0), device=local_anchor.device)
             local_labels = torch.cat([batch_ids, batch_ids], dim=0)
-            loss_local = multi_similarity_loss(
-                local_embeddings, local_labels
-            )
+            loss_local = multi_similarity_loss(local_embeddings, local_labels)
 
             anchor_tokens = feats_anchor["patch_tokens_flat"].detach()
             pos_tokens = feats_pos["patch_tokens_flat"].detach()
@@ -785,14 +710,8 @@ if should_train_disc21:
                 neg_feats = ced_model.backbone.get_features_from_images(x_neg)
             neg_tokens = neg_feats["patch_tokens_flat"].detach()
 
-            logits_pos = ced_model.classifier(
-                anchor_tokens,
-                pos_tokens,
-            ).squeeze(-1)
-            logits_neg = ced_model.classifier(
-                anchor_tokens,
-                neg_tokens,
-            ).squeeze(-1)
+            logits_pos = ced_model.classifier(anchor_tokens, pos_tokens).squeeze(-1)
+            logits_neg = ced_model.classifier(anchor_tokens, neg_tokens).squeeze(-1)
 
             labels_pos = torch.ones_like(logits_pos)
             labels_neg = torch.zeros_like(logits_neg)
@@ -808,21 +727,20 @@ if should_train_disc21:
             )
 
             loss.backward()
-
             torch.nn.utils.clip_grad_norm_(ced_model.parameters(), max_norm=1.0)
-
             optimizer.step()
 
             total_loss += loss.item()
 
-            progress.set_postfix({
-                "loss": f"{loss.item():.4f}",
-                "contrast": f"{loss_contrast.item():.4f}",
-                "local": f"{loss_local.item():.4f}",
-            })
+            progress.set_postfix(
+                {
+                    "loss": f"{loss.item():.4f}",
+                    "contrast": f"{loss_contrast.item():.4f}",
+                    "local": f"{loss_local.item():.4f}",
+                }
+            )
 
         avg_loss = total_loss / len(train_loader)
-
         print(f"DISC21 Epoch {epoch + 1}: avg loss = {avg_loss:.4f}")
 
         if avg_loss + cfg.early_stopping_min_delta_disc21 < best_disc21_loss:
@@ -837,16 +755,12 @@ if should_train_disc21:
                 )
                 break
 
-
-
 if should_train_ndec:
     did_train = True
-
     best_ndec_loss = float("inf")
     ndec_bad_epochs = 0
 
     for epoch in range(cfg.num_epochs_ndec):
-
         ced_model.train()
         total_loss = 0.0
 
@@ -856,7 +770,6 @@ if should_train_ndec:
         )
 
         for img_a, img_b, _, _ in progress:
-
             img_a = img_a.to(device)
             img_b = img_b.to(device)
 
@@ -876,7 +789,6 @@ if should_train_ndec:
             optimizer.step()
 
             total_loss += loss_asl.item()
-
             progress.set_postfix({"asl_loss": f"{loss_asl.item():.4f}"})
 
         avg_asl = total_loss / len(ndec_neg_pair_loader)
@@ -893,9 +805,7 @@ if should_train_ndec:
                     f" {cfg.early_stopping_patience_ndec} epoch(s)."
                 )
                 break
-
 else:
-
     if not should_train_disc21:
         print("Training loops are disabled by default—enable the flags above to run them.")
 
@@ -903,37 +813,11 @@ if did_train:
     save_checkpoint(ced_model, optimizer, str(cfg.checkpoint_path))
     print(f"Saved final checkpoint to {cfg.checkpoint_path}")
 
-# %% [markdown]
-# # Evaluation on DISC21 Dev/Test (Retrieval)
-# 
-# Precompute reference embeddings, rank candidates via cosine similarity, and report retrieval metrics such as mAP and Recall@K. Use `run_disc21_retrieval_pipeline` to execute the full encode + score routine for either dev or test splits.
-
-# %%
-def compute_descriptors_for_loader(loader: DataLoader, model: CEDModel, save_path_prefix: str):
-    """Encode a loader and optionally persist descriptors for fast reuse."""
-
-    prefix_path = Path(save_path_prefix)
-    prefix_path.parent.mkdir(parents=True, exist_ok=True)
-    all_vecs: List[torch.Tensor] = []
-    all_ids: List[str] = []
-    model.eval()
-
-    with torch.no_grad():
-        for imgs, sample_ids in tqdm(loader, desc=f"Encoding {prefix_path.stem}"):
-            descriptors, _ = model.encode_images(imgs.to(device))
-            all_vecs.append(descriptors.cpu())
-            all_ids.extend([str(sid) for sid in sample_ids])
-
-    all_vecs = torch.cat(all_vecs, dim=0)
-    torch.save(all_vecs, f"{save_path_prefix}_embeddings.pt")
-    np.save(f"{save_path_prefix}_ids.npy", np.array(all_ids))
-
-    return all_vecs, all_ids
-
-
+# ------------------------------------------------------------------
+# Evaluation on DISC21 Dev/Test (Retrieval) using eval_utils
+# ------------------------------------------------------------------
 def load_ground_truth_map(split: str, root: Path) -> Dict[str, List[str]]:
     """Read DISC21 ground truth for a split via the helper and build a query->refs map."""
-
     df = load_groundtruth(split=split, root=root)
     gt: Dict[str, List[str]] = {}
     for row in df.itertuples():
@@ -941,86 +825,20 @@ def load_ground_truth_map(split: str, root: Path) -> Dict[str, List[str]]:
         rid = str(getattr(row, "reference_id"))
         if rid and rid != "nan":
             gt.setdefault(qid, []).append(rid)
-
     return gt
 
 
-def cosine_similarity(queries: torch.Tensor, refs: torch.Tensor) -> torch.Tensor:
-    queries = F.normalize(queries, dim=-1)
-    refs = F.normalize(refs, dim=-1)
-
-    return queries @ refs.t()
-
-def evaluate_retrieval(
-    query_vecs: torch.Tensor,
-    query_ids: List[str],
-    ref_vecs: torch.Tensor,
-    ref_ids: List[str],
-    gt_map: Dict[str, List[str]],
-    topk: int = 10,
- ) -> Dict[str, float]:
-    """Compute Recall@K and mAP@K using cosine similarity rankings."""
-
-    # Normalize IDs to compare: drop extensions
-    query_ids_norm = [Path(qid).stem for qid in query_ids]
-    ref_ids_norm = [Path(rid).stem for rid in ref_ids]
-
-    # Build lookup using normalized IDs
-    ref_ids_arr = np.array(ref_ids)
-    ref_ids_norm_arr = np.array(ref_ids_norm)
-
-    ref_vecs = ref_vecs.to(device)
-    query_vecs = query_vecs.to(device)
-    sims = cosine_similarity(query_vecs, ref_vecs)
-
-    k = min(topk, ref_vecs.size(0))
-    topk_idx = sims.topk(k, dim=1).indices.cpu()
-
-    num_evaluable = 0
-    recall_hits = 0
-    map_sum = 0.0
-
-    for q_idx, qid_norm in enumerate(query_ids_norm):
-        gt_ids = gt_map.get(qid_norm, [])
-        if not gt_ids:
-            continue
-
-        num_evaluable += 1
-        retrieved_norm = ref_ids_norm_arr[topk_idx[q_idx].numpy()]
-        gt_set = set(gt_ids)
-
-        # Recall@K
-        if any(rid in gt_set for rid in retrieved_norm[:k]):
-            recall_hits += 1
-
-        # mAP@K
-        hits = 0
-        ap = 0.0
-        for rank, ref_id_norm in enumerate(retrieved_norm[:k], start=1):
-            if ref_id_norm in gt_set:
-                hits += 1
-                ap += hits / rank
-        if hits > 0:
-            ap /= len(gt_ids)
-        map_sum += ap
-
-    if num_evaluable == 0:
-        return {f"Recall@{k}": 0.0, f"mAP@{k}": 0.0}
-
-    return {
-        f"Recall@{k}": recall_hits / num_evaluable,
-        f"mAP@{k}": map_sum / num_evaluable,
-    }
-
-
-def run_disc21_retrieval_pipeline(split: str = "dev", topk: int = 10):
+def run_disc21_retrieval_pipeline(
+    split: str = "dev",
+    topk_list: List[int] = [1, 2, 5, 10, 15, 20],
+):
     """Encode DISC21 references/queries and report retrieval metrics for a split."""
-
     split = split.lower()
     if split not in {"dev", "test"}:
         raise ValueError("split must be 'dev' or 'test'")
 
     query_loader = dev_query_loader if split == "dev" else test_query_loader
+
     ref_vecs, ref_ids = compute_descriptors_for_loader(
         ref_loader, ced_model, "artifacts/disc21_ref"
     )
@@ -1028,18 +846,64 @@ def run_disc21_retrieval_pipeline(split: str = "dev", topk: int = 10):
         query_loader, ced_model, f"artifacts/disc21_{split}_query"
     )
     gt_map = load_ground_truth_map(split=split, root=disc_cfg.root)
-    metrics = evaluate_retrieval(query_vecs, query_ids, ref_vecs, ref_ids, gt_map, topk=topk)
+    metrics = evaluate_retrieval(
+        query_vecs,
+        query_ids,
+        ref_vecs,
+        ref_ids,
+        gt_map,
+        topk_list=topk_list,
+    )
     print(f"DISC21 {split} metrics: {metrics}")
     return metrics
 
-# %% [markdown]
-# ## NDEC Copy-Edit Classifier Evaluation
-# 
-# Use NDEC positive and negative pairs to evaluate the copy-edit classifier head.
-# Positive pairs = true matches from the NDEC ground-truth CSV.
-# Negative pairs = explicit mismatches from the `negative_pair/` folders.
 
-# %%
+def run_disc21_tta_sweep(
+    split: str = "dev",
+    views_list: List[int] = [1, 2, 3, 4, 5, 6],
+):
+    """
+    Run DISC21 retrieval with TTA sensitivity over num_views (transformations per image).
+    Uses shared compute_descriptors_for_loader_tta & evaluate_retrieval.
+    """
+    split = split.lower()
+    if split not in {"dev", "test"}:
+        raise ValueError("split must be 'dev' or 'test'")
+
+    query_loader = dev_query_loader if split == "dev" else test_query_loader
+    gt_map = load_ground_truth_map(split=split, root=disc_cfg.root)
+
+    # Reference descriptors reused across TTA settings
+    ref_vecs, ref_ids = compute_descriptors_for_loader(
+        ref_loader, ced_model, "artifacts/disc21_ref"
+    )
+
+    results = {}
+    for v in views_list:
+        print(f"\n=== DISC21 {split} TTA x{v} ===")
+        q_vecs, q_ids = compute_descriptors_for_loader_tta(
+            query_loader,
+            ced_model,
+            f"artifacts/disc21_{split}_query",
+            num_views=v,
+            aug=copy_edit_aug,
+        )
+        metrics = evaluate_retrieval(
+            q_vecs,
+            q_ids,
+            ref_vecs,
+            ref_ids,
+            gt_map,
+            topk_list=[1, 2, 5, 10, 15, 20],
+        )
+        print(metrics)
+        results[v] = metrics
+
+    return results
+
+# ------------------------------------------------------------------
+# NDEC Copy-Edit Classifier Evaluation (pairwise classification)
+# ------------------------------------------------------------------
 def evaluate_ndec_copy_edit_classifier(
     model: CEDModel,
     pos_loader: DataLoader,
@@ -1111,23 +975,13 @@ def evaluate_ndec_copy_edit_classifier(
         "average_precision": average_precision,
     }
 
-
-# Example usage (after training)
-# ndec_cls_metrics = evaluate_ndec_copy_edit_classifier(
-#     ced_model,
-#     ndec_pos_pair_loader,
-#     ndec_neg_pair_loader,
-# )
-# print("NDEC classifier metrics:", ndec_cls_metrics)
-
-# %% [markdown]
-# ## NDEC Retrieval Evaluation
-# 
-# Reuse the same descriptor helpers on the NDEC query/reference sets, then score with the shared retrieval evaluator to report mAP/Recall.
-
-# %%
+# ------------------------------------------------------------------
+# NDEC Retrieval Evaluation using eval_utils
+# ------------------------------------------------------------------
 def load_ndec_groundtruth_map(
-    root: Path, csv_name: str = "public_ground_truth_h5.csv", drop_missing: bool = False
+    root: Path,
+    csv_name: str = "public_ground_truth_h5.csv",
+    drop_missing: bool = False,
 ) -> Dict[str, List[str]]:
     df = load_ndec_groundtruth(root=root, csv_name=csv_name, drop_missing=drop_missing)
     gt: Dict[str, List[str]] = {}
@@ -1138,19 +992,58 @@ def load_ndec_groundtruth_map(
     return gt
 
 
-
-def run_ndec_retrieval_pipeline(topk: int = 10):
+def run_ndec_retrieval_pipeline(
+    topk_list: List[int] = [1, 2, 5, 10, 15, 20],
+):
     """Compute NDEC retrieval metrics via the shared evaluator."""
+    ref_vecs, ref_ids = compute_descriptors_for_loader(
+        ndec_ref_loader, ced_model, "artifacts/ndec_ref"
+    )
+    query_vecs, query_ids = compute_descriptors_for_loader(
+        ndec_query_loader, ced_model, "artifacts/ndec_query"
+    )
+    gt_map = load_ndec_groundtruth_map(ndec_cfg.root, drop_missing=True)
+    metrics = evaluate_retrieval(
+        query_vecs,
+        query_ids,
+        ref_vecs,
+        ref_ids,
+        gt_map,
+        topk_list=topk_list,
+    )
+    print(f"NDEC metrics: {metrics}")
+    return metrics
+
+
+def run_ndec_tta_sweep(
+    views_list: List[int] = [1, 2, 3, 4, 5, 6],
+):
+    """Run NDEC retrieval with TTA sensitivity over num_views (transformations per image)."""
+    gt_map = load_ndec_groundtruth_map(ndec_cfg.root, drop_missing=True)
 
     ref_vecs, ref_ids = compute_descriptors_for_loader(
         ndec_ref_loader, ced_model, "artifacts/ndec_ref"
-)
-    query_vecs, query_ids = compute_descriptors_for_loader(
-        ndec_query_loader, ced_model, "artifacts/ndec_query"
-)
-    gt_map = load_ndec_groundtruth_map(ndec_cfg.root, drop_missing=True)
-    metrics = evaluate_retrieval(
-        query_vecs, query_ids, ref_vecs, ref_ids, gt_map, topk=topk
-)
-    print(f"NDEC metrics: {metrics}")
-    return metrics
+    )
+
+    results = {}
+    for v in views_list:
+        print(f"\n=== NDEC TTA x{v} ===")
+        q_vecs, q_ids = compute_descriptors_for_loader_tta(
+            ndec_query_loader,
+            ced_model,
+            "artifacts/ndec_query",
+            num_views=v,
+            aug=copy_edit_aug,
+        )
+        metrics = evaluate_retrieval(
+            q_vecs,
+            q_ids,
+            ref_vecs,
+            ref_ids,
+            gt_map,
+            topk_list=[1, 2, 5, 10, 15, 20],
+        )
+        print(metrics)
+        results[v] = metrics
+
+    return results
