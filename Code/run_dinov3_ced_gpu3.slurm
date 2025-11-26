@@ -7,8 +7,8 @@
 #SBATCH --partition=week-long-gpu
 #SBATCH --nodelist=gpu3
 #SBATCH --gres=gpu:A30:3
-#SBATCH --output=/home/jowatson/slurm_logs/dinov3_ced_gpu3_%j.out
-#SBATCH --error=/home/jowatson/slurm_logs/dinov3_ced_gpu3_%j.err
+#SBATCH --output="/home/jowatson/Deep Learning/slurm_logs/dinov3_ced_gpu3_%j.out"
+#SBATCH --error="/home/jowatson/Deep Learning/slurm_logs/dinov3_ced_gpu3_%j.err"
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=jowatson@clarku.edu
 
