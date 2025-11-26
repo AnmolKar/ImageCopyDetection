@@ -1,0 +1,65 @@
+#!/bin/bash
+#SBATCH --job-name=dinov3_ced_gpu3
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --time=7-00:00:00
+#SBATCH --partition=week-long-gpu
+#SBATCH --nodelist=gpu3
+#SBATCH --gres=gpu:A30:3
+#SBATCH --output=/home/jowatson/slurm_logs/dinov3_ced_gpu3_%j.out
+#SBATCH --error=/home/jowatson/slurm_logs/dinov3_ced_gpu3_%j.err
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=jowatson@clarku.edu
+
+set -euo pipefail
+
+LOG_DIR="/home/jowatson/Deep Learning/slurm_logs"
+PROJECT_ROOT="/home/jowatson/Deep Learning/Code"
+SCRIPT_PATH="${PROJECT_ROOT}/DINOv3_CED_DDP.py"   # <- your DDP script
+NPROC_PER_NODE=3                                 # number of GPUs/processes
+
+mkdir -p "$LOG_DIR"
+
+echo "Host: $(hostname)"
+echo "Job ID: ${SLURM_JOB_ID:-none}"
+echo "GPUs requested: ${SLURM_GPUS_ON_NODE:-1}"
+
+# ----------------- OMP_NUM_THREADS tuning -----------------
+CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-32}
+THREADS_PER_PROC=$(( CPUS_PER_TASK / NPROC_PER_NODE ))
+if [ "$THREADS_PER_PROC" -lt 1 ]; then
+    THREADS_PER_PROC=1
+fi
+
+export OMP_NUM_THREADS=$THREADS_PER_PROC
+echo "OMP_NUM_THREADS set to $OMP_NUM_THREADS (CPUS_PER_TASK=$CPUS_PER_TASK, NPROC_PER_NODE=$NPROC_PER_NODE)"
+
+# If you use MKL (PyTorch does): keep them in sync
+export MKL_NUM_THREADS=$OMP_NUM_THREADS
+
+echo "Starting run at $(date)"
+
+if command -v conda >/dev/null 2>&1; then
+    source "$(conda info --base)/etc/profile.d/conda.sh"
+    conda activate gpu_training
+else
+    echo "[FATAL] Conda not found in PATH" >&2
+    exit 1
+fi
+
+nvidia-smi
+
+cd "$PROJECT_ROOT"
+export PYTHONUNBUFFERED=1
+
+echo "Launching torchrun at $(date)"
+torchrun \
+  --nproc_per_node=$NPROC_PER_NODE \
+  --nnodes=1 \
+  --node_rank=0 \
+  --master_addr="127.0.0.1" \
+  --master_port=29500 \
+  "$SCRIPT_PATH"
+
+echo "Job finished at $(date)"

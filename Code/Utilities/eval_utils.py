@@ -1,4 +1,3 @@
-# eval_utils.py
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -39,7 +38,14 @@ def compute_descriptors_for_loader(
         for imgs, sample_ids in tqdm(loader, desc=f"Encoding {prefix_path.stem}"):
             imgs = imgs.to(device)
             descriptors, _ = model.encode_images(imgs)
-            all_vecs.append(descriptors.cpu())
+            # Move descriptors to FP32 on CPU for stable metrics + storage
+            descriptors = descriptors.float().cpu()
+            if not torch.isfinite(descriptors).all():
+                raise RuntimeError(
+                    f"Non-finite descriptors encountered in compute_descriptors_for_loader "
+                    f"for prefix {save_path_prefix}"
+                )
+            all_vecs.append(descriptors)
             all_ids.extend([str(sid) for sid in sample_ids])
 
     if not all_vecs:
@@ -96,7 +102,14 @@ def compute_descriptors_for_loader_tta(
                     views.append(desc_v)
                 desc = torch.stack(views, dim=0).mean(dim=0)
 
-            all_vecs.append(desc.cpu())
+            desc = desc.float().cpu()
+            if not torch.isfinite(desc).all():
+                raise RuntimeError(
+                    f"Non-finite descriptors encountered in compute_descriptors_for_loader_tta "
+                    f"for prefix {save_path_prefix}"
+                )
+
+            all_vecs.append(desc)
             all_ids.extend([str(sid) for sid in sample_ids])
 
     if not all_vecs:
@@ -116,9 +129,10 @@ def cosine_similarity(queries: torch.Tensor, refs: torch.Tensor) -> torch.Tensor
     """
     Cosine similarity between query and ref embeddings.
     Tensors may live on any device; computation stays on that device.
+    Uses FP32 for robustness.
     """
-    queries = F.normalize(queries, dim=-1)
-    refs = F.normalize(refs, dim=-1)
+    queries = F.normalize(queries.float(), dim=-1)
+    refs = F.normalize(refs.float(), dim=-1)
     return queries @ refs.t()
 
 

@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import warnings
 from pathlib import Path
 from dataclasses import dataclass
@@ -51,7 +52,7 @@ from ndec_loader import (  # type: ignore
 from eval_utils import (
     compute_descriptors_for_loader,
     evaluate_retrieval,
-    compute_descriptors_for_loader_tta,  
+    compute_descriptors_for_loader_tta,
     cosine_similarity,
     compute_muap_and_rp90,
     benchmark_inference,
@@ -116,12 +117,21 @@ class ExperimentConfig:
     lambda_local: float = 1.0
     lambda_bce: float = 1.0
     lambda_asl_mtr: float = 1.0
+
+    # Epochs
     num_epochs_disc21: int = 30
     num_epochs_ndec: int = 20
-    early_stopping_patience_disc21: int = 3
-    early_stopping_min_delta_disc21: float = 1e-4
+
+    # Early stopping (DISC21)
+    early_stopping_patience_disc21: int = 4
+    early_stopping_min_delta_disc21: float = 5e-5
+    min_epochs_disc21: int = 15
+
+    # Early stopping (NDEC)
     early_stopping_patience_ndec: int = 2
-    early_stopping_min_delta_ndec: float = 1e-4
+    early_stopping_min_delta_ndec: float = 5e-5
+    min_epochs_ndec: int = 5
+
     checkpoint_path: Path = Path("artifacts/checkpoints/ced_model_ddp.pt")
 
 
@@ -374,7 +384,7 @@ class CEDModel(nn.Module):
 
 
 # ======================================================================
-# Losses, augmentations
+# Losses, augmentations (with FP32 + NaN guards)
 # ======================================================================
 copy_edit_aug = V.Compose(
     [
@@ -397,13 +407,14 @@ def make_positive_negative_pairs(batch_imgs: torch.Tensor) -> Tuple[torch.Tensor
 
 
 def nt_xent_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.2) -> torch.Tensor:
-    z1 = F.normalize(z1, dim=-1)
-    z2 = F.normalize(z2, dim=-1)
+    # Force FP32 for numeric stability
+    z1 = F.normalize(z1.float(), dim=-1)
+    z2 = F.normalize(z2.float(), dim=-1)
     reps = torch.cat([z1, z2], dim=0)
-    sim = reps @ reps.t() / temperature
+    sim = reps @ reps.t()
+    sim = sim / temperature
+    sim = sim.float()
     mask = torch.eye(sim.size(0), dtype=torch.bool, device=sim.device)
-    if not torch.is_floating_point(sim):
-        raise TypeError("Similarity matrix must be floating point for NT-Xent loss")
     fill_value = torch.finfo(sim.dtype).min
     sim.masked_fill_(mask, float(fill_value))
     batch_size = z1.size(0)
@@ -414,13 +425,14 @@ def nt_xent_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.2) -
 
 
 def similarity_kl_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
-    z1 = F.normalize(z1, dim=-1)
-    z2 = F.normalize(z2, dim=-1)
+    # FP32 for stability
+    z1 = F.normalize(z1.float(), dim=-1)
+    z2 = F.normalize(z2.float(), dim=-1)
     sim1 = z1 @ z1.t() / temperature
     sim2 = z2 @ z2.t() / temperature
+    sim1 = sim1.float()
+    sim2 = sim2.float()
     mask = torch.eye(sim1.size(0), dtype=torch.bool, device=sim1.device)
-    if not torch.is_floating_point(sim1):
-        raise TypeError("Similarity matrix must be floating point for KL loss")
     fill_value = torch.finfo(sim1.dtype).min
     sim1.masked_fill_(mask, float(fill_value))
     sim2.masked_fill_(mask, float(fill_value))
@@ -435,14 +447,17 @@ def multi_similarity_loss(
     embeddings: torch.Tensor,
     labels: torch.Tensor,
     alpha: float = 2.0,
-    beta: float = 50.0,
+    beta: float = 20.0,  # slightly softer than 50 for stability
     margin: float = 0.5,
 ) -> torch.Tensor:
     if embeddings.size(0) < 2:
         return torch.tensor(0.0, device=embeddings.device)
+
+    embeddings = embeddings.float()
     sims = F.normalize(embeddings, dim=-1) @ F.normalize(embeddings, dim=-1).t()
     loss = torch.zeros(1, device=embeddings.device)
     valid = 0
+
     for i in range(embeddings.size(0)):
         pos_mask = (labels == labels[i]).clone()
         pos_mask[i] = False
@@ -451,14 +466,17 @@ def multi_similarity_loss(
         neg_sims = sims[i][neg_mask]
         if pos_sims.numel() == 0 or neg_sims.numel() == 0:
             continue
+
+        # Clamp exponents to avoid overflow
         pos_term = (1.0 / alpha) * torch.log1p(
-            torch.sum(torch.exp(-alpha * (pos_sims - (1 - margin))))
+            torch.sum(torch.exp(torch.clamp(-alpha * (pos_sims - (1 - margin)), max=20.0)))
         )
         neg_term = (1.0 / beta) * torch.log1p(
-            torch.sum(torch.exp(beta * (neg_sims - margin)))
+            torch.sum(torch.exp(torch.clamp(beta * (neg_sims - margin), max=20.0)))
         )
         loss = loss + pos_term + neg_term
         valid += 1
+
     if valid == 0:
         return torch.tensor(0.0, device=embeddings.device)
     return loss / valid
@@ -470,9 +488,15 @@ def asl_loss(
     lambda_mtr: float = 1.0,
     eps: float = 1e-6,
 ) -> torch.Tensor:
+    # FP32 for stability
+    v_former = v_former.float()
+    v_latter = v_latter.float()
+
     norm_f = v_former.norm(p=2, dim=-1)
     norm_l = v_latter.norm(p=2, dim=-1)
     ratio = (norm_l + eps) / (norm_f + eps)
+    # Clamp ratio to avoid huge exp()
+    ratio = torch.clamp(ratio, 0.1, 10.0)
     loss_ratio = torch.exp(1.0 - ratio).mean()
     loss_metric = nt_xent_loss(v_former, v_latter)
     return loss_ratio + lambda_mtr * loss_metric
@@ -482,18 +506,60 @@ bce_loss = nn.BCEWithLogitsLoss()
 
 
 # ======================================================================
-# Checkpoint helpers
+# Checkpoint helpers (with training_state)
 # ======================================================================
-def save_checkpoint(model: CEDModel, optimizer: torch.optim.Optimizer, path: str, rank: int):
+def save_checkpoint(
+    model: CEDModel,
+    optimizer: torch.optim.Optimizer,
+    path: str,
+    rank: int,
+    training_state: Dict,
+):
     if rank != 0:
         return
     ckpt = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
+        "state": training_state,
     }
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    path_obj = Path(path)
+    path_obj.parent.mkdir(parents=True, exist_ok=True)
     torch.save(ckpt, path)
     print(f"[Rank 0] Saved checkpoint to {path}")
+
+
+def load_checkpoint_if_available(
+    model: CEDModel,
+    optimizer: Optional[torch.optim.Optimizer],
+    path: str,
+    rank: int,
+    training_state: Dict,
+) -> Dict:
+    """
+    If checkpoint exists, load model, optimizer, and training_state.
+    Returns updated training_state dict.
+    """
+    if not os.path.exists(path):
+        if rank == 0:
+            print(f"[Checkpoint] No existing checkpoint at {path}, starting fresh.")
+        return training_state
+
+    map_location = device if torch.cuda.is_available() else "cpu"
+    ckpt = torch.load(path, map_location=map_location)
+    model.load_state_dict(ckpt["model"])
+    if optimizer is not None and "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
+
+    loaded_state = ckpt.get("state", {})
+    training_state.update(loaded_state)
+
+    if rank == 0:
+        print(f"[Checkpoint] Loaded checkpoint from {path}")
+        print(
+            f"[Checkpoint] Resuming from DISC21 epoch {training_state['epoch_disc21']} "
+            f"and NDEC epoch {training_state['epoch_ndec']}"
+        )
+    return training_state
 
 
 # ======================================================================
@@ -528,13 +594,15 @@ def load_ndec_groundtruth_map(
 
 
 # ======================================================================
-# Main training + evaluation (DDP)
+# Main training + evaluation (DDP) with resume
 # ======================================================================
 def main():
     global device
 
     # ------------------ basic setup ------------------
-    env_path = Path(__file__).resolve().parent / ".env"
+    script_dir = Path(__file__).resolve().parent
+
+    env_path = script_dir / ".env"
     if env_path.exists():
         load_dotenv(env_path)
     else:
@@ -553,6 +621,9 @@ def main():
         print("Config:", cfg)
         print(f"World size: {world_size} | Rank: {rank} | Local rank: {local_rank}")
         sys.stdout.flush()
+
+    # Make checkpoint path relative to script dir
+    checkpoint_path = str((script_dir / cfg.checkpoint_path).resolve())
 
     # Update augment crop size based on config
     global copy_edit_aug
@@ -575,7 +646,7 @@ def main():
         num_workers=cfg.num_workers,
     )
 
-    ndec_data_cfg = NdecDataConfig(
+    ndec_data_cfg = NdecConfig(
         root=ndec_cfg.root,
         img_size_train=ndec_cfg.img_size_train,
         img_size_eval=ndec_cfg.img_size_eval,
@@ -634,11 +705,26 @@ def main():
         ref_loader = dev_query_loader = test_query_loader = None  # type: ignore
 
     # NDEC loaders (query, ref, pos, neg)
-    ndec_query_loader, ndec_ref_loader, ndec_pos_pair_loader, ndec_neg_pair_loader = build_ndec_loaders(ndec_data_cfg)
+    ndec_query_loader, ndec_ref_loader, ndec_pos_pair_loader, ndec_neg_pair_loader = build_ndec_loaders(
+        ndec_data_cfg
+    )
+
+    # Create a DDP-aware loader for NDEC negative pairs (ASL stage)
+    ndec_neg_dataset = ndec_neg_pair_loader.dataset
+    ndec_neg_sampler = DistributedSampler(
+        ndec_neg_dataset, num_replicas=world_size, rank=rank, shuffle=True
+    )
+    ndec_neg_train_loader = DataLoader(
+        ndec_neg_dataset,
+        batch_size=ndec_data_cfg.batch_size_pairs,
+        sampler=ndec_neg_sampler,
+        num_workers=ndec_data_cfg.num_workers,
+        pin_memory=True,
+    )
 
     if rank == 0:
         print(f"Train images: {len(train_ds):,}")
-        print(f"NDEC negative pairs batches: {len(ndec_neg_pair_loader):,}")
+        print(f"NDEC negative pairs batches (per rank): {len(ndec_neg_train_loader):,}")
         sys.stdout.flush()
 
     # ------------------ model + optimizer (wrapped in DDP) ------------------
@@ -664,27 +750,69 @@ def main():
         weight_decay=cfg.weight_decay,
     )
 
+    # ------------------ training state (for resume) ------------------
+    # Defaults if no checkpoint exists
+    training_state = {
+        "epoch_disc21": 0,
+        "epoch_ndec": 0,
+        "best_disc21_loss": float("inf"),
+        "best_ndec_loss": float("inf"),
+        "disc21_bad_epochs": 0,
+        "ndec_bad_epochs": 0,
+        "disc21_losses": [],
+        "ndec_losses": [],
+    }
+
+    # Try to load checkpoint (if exists) and update training_state
+    training_state = load_checkpoint_if_available(
+        ddp_model.module, optimizer, checkpoint_path, rank, training_state
+    )
+
+    start_epoch_disc21 = training_state["epoch_disc21"]
+    start_epoch_ndec = training_state["epoch_ndec"]
+    best_disc21_loss = training_state["best_disc21_loss"]
+    best_ndec_loss = training_state["best_ndec_loss"]
+    disc21_bad_epochs = training_state["disc21_bad_epochs"]
+    ndec_bad_epochs = training_state["ndec_bad_epochs"]
+    disc21_losses: List[float] = training_state["disc21_losses"]
+    ndec_losses: List[float] = training_state["ndec_losses"]
+
     # ------------------ training flags ------------------
     should_train_disc21 = True
-    should_train_ndec = True  # NDEC ASL stage runs on rank 0 only
+    should_train_ndec = True  # NDEC ASL stage uses DDP on all ranks
     did_train = False
+
+    # If we've already reached/exceeded the max epochs, skip that stage
+    if start_epoch_disc21 >= cfg.num_epochs_disc21:
+        should_train_disc21 = False
+        if rank == 0:
+            print(f"[DISC21] Already completed {start_epoch_disc21} epochs; skipping DISC21 training.")
+    if start_epoch_ndec >= cfg.num_epochs_ndec:
+        should_train_ndec = False
+        if rank == 0:
+            print(f"[NDEC] Already completed {start_epoch_ndec} epochs; skipping NDEC training.")
 
     # ------------------ DISC21 training loop (DDP) ------------------
     if should_train_disc21:
         did_train = True
-        best_disc21_loss = float("inf")
-        disc21_bad_epochs = 0
 
-        for epoch in range(cfg.num_epochs_disc21):
+        if rank == 0 and start_epoch_disc21 > 0:
+            print(f"[DISC21] Resuming from epoch {start_epoch_disc21 + 1}")
+            sys.stdout.flush()
+
+        for epoch in range(start_epoch_disc21, cfg.num_epochs_disc21):
             ddp_model.train()
             train_sampler.set_epoch(epoch)
+            current_epoch = epoch + 1
 
             if rank == 0:
-                progress = tqdm(train_loader, desc=f"[DISC21][Epoch {epoch+1}/{cfg.num_epochs_disc21}]")
+                progress = tqdm(train_loader, desc=f"[DISC21][Epoch {current_epoch}/{cfg.num_epochs_disc21}]")
             else:
                 progress = train_loader
 
             epoch_loss = 0.0
+            epoch_correct = 0.0
+            epoch_total = 0.0
 
             for imgs, _ in progress:
                 imgs = imgs.to(device, non_blocking=True)
@@ -729,56 +857,121 @@ def main():
                     + cfg.lambda_bce * loss_bce
                 )
 
+                # NaN / inf guard
+                if not torch.isfinite(loss):
+                    if rank == 0:
+                        print("[WARN][DISC21] Non-finite loss encountered; skipping batch.")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), max_norm=1.0)
                 optimizer.step()
 
+                # tracking
                 epoch_loss += loss.item()
 
+                with torch.no_grad():
+                    preds = (torch.sigmoid(logits) >= 0.5).float()
+                    correct = (preds == labels).sum().item()
+                    total = labels.numel()
+                    epoch_correct += correct
+                    epoch_total += total
+
                 if rank == 0:
+                    batch_acc = correct / max(total, 1)
                     progress.set_postfix(
                         {
                             "loss": f"{loss.item():.4f}",
                             "contrast": f"{loss_contrast.item():.4f}",
                             "local": f"{loss_local.item():.4f}",
+                            "bce_acc": f"{batch_acc:.3f}",
                         }
                     )
 
             # Average loss across processes
             epoch_loss_tensor = torch.tensor(epoch_loss, device=device)
             dist.all_reduce(epoch_loss_tensor, op=dist.ReduceOp.SUM)
-            epoch_loss_avg = epoch_loss_tensor.item() / world_size / len(train_loader)
+            epoch_loss_avg = epoch_loss_tensor.item() / world_size / max(len(train_loader), 1)
 
+            # Accuracy across processes (sample-weighted)
+            correct_tensor = torch.tensor(epoch_correct, device=device)
+            total_tensor = torch.tensor(epoch_total, device=device)
+            dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+            epoch_acc_global = (
+                (correct_tensor.item() / max(total_tensor.item(), 1.0)) if total_tensor.item() > 0 else 0.0
+            )
+
+            # Early stopping logic + checkpointing (rank 0), then sync stop flag
+            stop_now = False
             if rank == 0:
-                print(f"[DISC21][Epoch {epoch+1}] avg loss across ranks = {epoch_loss_avg:.4f}")
+                disc21_losses.append(epoch_loss_avg)
+                print(
+                    f"[DISC21][Epoch {current_epoch}] avg loss across ranks = {epoch_loss_avg:.4f}, "
+                    f"BCE accuracy = {epoch_acc_global:.4f}"
+                )
                 sys.stdout.flush()
 
-                if epoch_loss_avg + cfg.early_stopping_min_delta_disc21 < best_disc21_loss:
+                improved = epoch_loss_avg + cfg.early_stopping_min_delta_disc21 < best_disc21_loss
+                if improved:
                     best_disc21_loss = epoch_loss_avg
                     disc21_bad_epochs = 0
-                    save_checkpoint(ddp_model.module, optimizer, str(cfg.checkpoint_path), rank=0)
                 else:
                     disc21_bad_epochs += 1
-                    if disc21_bad_epochs >= cfg.early_stopping_patience_disc21:
-                        print(
-                            f"[DISC21] Early stopping after {cfg.early_stopping_patience_disc21} bad epoch(s)."
-                        )
-                        break
 
-    # ------------------ NDEC ASL fine-tuning (rank 0 only) ------------------
-    if should_train_ndec and rank == 0:
+                # update training_state and save checkpoint every epoch
+                training_state["epoch_disc21"] = current_epoch
+                training_state["best_disc21_loss"] = best_disc21_loss
+                training_state["disc21_bad_epochs"] = disc21_bad_epochs
+                training_state["disc21_losses"] = disc21_losses
+
+                save_checkpoint(ddp_model.module, optimizer, checkpoint_path, rank=0, training_state=training_state)
+
+                can_stop_disc21 = current_epoch >= cfg.min_epochs_disc21
+                if not improved and disc21_bad_epochs >= cfg.early_stopping_patience_disc21 and can_stop_disc21:
+                    print(
+                        f"[DISC21] Early stopping after {cfg.early_stopping_patience_disc21} bad epoch(s)."
+                    )
+                    stop_now = True
+                elif not improved and disc21_bad_epochs >= cfg.early_stopping_patience_disc21:
+                    remaining = cfg.min_epochs_disc21 - current_epoch
+                    print(
+                        f"[DISC21] Patience exhausted but continuing {remaining} more epoch(s) "
+                        f"to satisfy min_epochs_disc21."
+                    )
+
+            # Broadcast stop flag so all ranks break together
+            stop_tensor = torch.tensor(1 if stop_now else 0, device=device)
+            dist.broadcast(stop_tensor, src=0)
+            if stop_tensor.item() == 1:
+                break
+
+    # ------------------ NDEC ASL fine-tuning (DDP on all ranks) ------------------
+    if should_train_ndec:
         did_train = True
-        best_ndec_loss = float("inf")
-        ndec_bad_epochs = 0
 
-        print("[NDEC] Starting ASL fine-tuning on rank 0 only.")
-        sys.stdout.flush()
+        if rank == 0:
+            if start_epoch_ndec > 0:
+                print(f"[NDEC] Resuming ASL fine-tuning from epoch {start_epoch_ndec + 1}.")
+            else:
+                print("[NDEC] Starting ASL fine-tuning with DDP on all ranks.")
+            sys.stdout.flush()
 
-        for epoch in range(cfg.num_epochs_ndec):
-            ddp_model.module.train()
+        for epoch in range(start_epoch_ndec, cfg.num_epochs_ndec):
+            ddp_model.train()
+            ndec_neg_sampler.set_epoch(epoch)
+            current_epoch = epoch + 1
+
+            if rank == 0:
+                progress = tqdm(
+                    ndec_neg_train_loader,
+                    desc=f"[NDEC][Epoch {current_epoch}/{cfg.num_epochs_ndec}]",
+                )
+            else:
+                progress = ndec_neg_train_loader
+
             total_loss = 0.0
-
-            progress = tqdm(ndec_neg_pair_loader, desc=f"[NDEC][Epoch {epoch+1}/{cfg.num_epochs_ndec}]")
 
             for img_a, img_b, _, _ in progress:
                 img_a = img_a.to(device, non_blocking=True)
@@ -791,28 +984,81 @@ def main():
 
                 loss_asl = asl_loss(v_former=v_former, v_latter=v_latter, lambda_mtr=cfg.lambda_asl_mtr)
 
+                # NaN / inf guard
+                if not torch.isfinite(loss_asl):
+                    if rank == 0:
+                        print("[WARN][NDEC] Non-finite ASL loss encountered; skipping batch.")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+
                 loss_asl.backward()
                 torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), max_norm=1.0)
                 optimizer.step()
 
                 total_loss += loss_asl.item()
-                progress.set_postfix({"asl_loss": f"{loss_asl.item():.4f}"})
 
-            avg_asl = total_loss / len(ndec_neg_pair_loader)
-            print(f"[NDEC][Epoch {epoch+1}] avg ASL loss = {avg_asl:.4f}")
-            sys.stdout.flush()
+                if rank == 0:
+                    progress.set_postfix({"asl_loss": f"{loss_asl.item():.4f}"})
 
-            if avg_asl + cfg.early_stopping_min_delta_ndec < best_ndec_loss:
-                best_ndec_loss = avg_asl
-                ndec_bad_epochs = 0
-                save_checkpoint(ddp_model.module, optimizer, str(cfg.checkpoint_path), rank=0)
-            else:
-                ndec_bad_epochs += 1
-                if ndec_bad_epochs >= cfg.early_stopping_patience_ndec:
+            # Average ASL loss across ranks
+            loss_tensor = torch.tensor(total_loss, device=device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            avg_asl_global = loss_tensor.item() / world_size / max(len(ndec_neg_train_loader), 1)
+
+            # Early stopping logic + checkpoint (rank 0), then sync stop flag
+            stop_now_ndec = False
+            if rank == 0:
+                ndec_losses.append(avg_asl_global)
+                print(f"[NDEC][Epoch {current_epoch}] avg ASL loss (global) = {avg_asl_global:.4f}")
+                sys.stdout.flush()
+
+                improved = avg_asl_global + cfg.early_stopping_min_delta_ndec < best_ndec_loss
+                if improved:
+                    best_ndec_loss = avg_asl_global
+                    ndec_bad_epochs = 0
+                else:
+                    ndec_bad_epochs += 1
+
+                training_state["epoch_ndec"] = current_epoch
+                training_state["best_ndec_loss"] = best_ndec_loss
+                training_state["ndec_bad_epochs"] = ndec_bad_epochs
+                training_state["ndec_losses"] = ndec_losses
+
+                save_checkpoint(ddp_model.module, optimizer, checkpoint_path, rank=0, training_state=training_state)
+
+                can_stop_ndec = current_epoch >= cfg.min_epochs_ndec
+                if not improved and ndec_bad_epochs >= cfg.early_stopping_patience_ndec and can_stop_ndec:
                     print(
                         f"[NDEC] Early stopping after {cfg.early_stopping_patience_ndec} bad epoch(s)."
                     )
-                    break
+                    stop_now_ndec = True
+                elif not improved and ndec_bad_epochs >= cfg.early_stopping_patience_ndec:
+                    remaining = cfg.min_epochs_ndec - current_epoch
+                    print(
+                        f"[NDEC] Patience exhausted but continuing {remaining} more epoch(s) "
+                        f"to satisfy min_epochs_ndec."
+                    )
+
+            stop_tensor_ndec = torch.tensor(1 if stop_now_ndec else 0, device=device)
+            dist.broadcast(stop_tensor_ndec, src=0)
+            if stop_tensor_ndec.item() == 1:
+                break
+
+    # ------------------ Dump training curves to JSON (rank 0) ------------------
+    if rank == 0:
+        log_dir = (script_dir / "artifacts/logs").resolve()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        curves_path = log_dir / "training_curves.json"
+        with curves_path.open("w") as f:
+            json.dump(
+                {
+                    "disc21_losses": disc21_losses,
+                    "ndec_losses": ndec_losses,
+                },
+                f,
+                indent=2,
+            )
+        print(f"[Logs] Wrote training curves to {curves_path}")
 
     # ------------------ Evaluation using eval_utils (rank 0 only) ------------------
     if rank == 0:
@@ -823,7 +1069,7 @@ def main():
 
         # ---- DISC21: compute reference descriptors once ----
         disc_ref_vecs, disc_ref_ids = compute_descriptors_for_loader(
-            ref_loader, eval_model, "artifacts/disc21_ref"
+            ref_loader, eval_model, str((script_dir / "artifacts/disc21_ref").resolve())
         )
 
         for split_name, q_loader in [("dev", dev_query_loader), ("test", test_query_loader)]:
@@ -831,7 +1077,7 @@ def main():
             sys.stdout.flush()
 
             q_vecs, q_ids = compute_descriptors_for_loader(
-                q_loader, eval_model, f"artifacts/disc21_{split_name}_query"
+                q_loader, eval_model, str((script_dir / f"artifacts/disc21_{split_name}_query").resolve())
             )
             gt_map = load_disc21_groundtruth_map(split=split_name, root=disc_cfg.root)
 
@@ -851,10 +1097,10 @@ def main():
         sys.stdout.flush()
 
         ndec_ref_vecs, ndec_ref_ids = compute_descriptors_for_loader(
-            ndec_ref_loader, eval_model, "artifacts/ndec_ref"
+            ndec_ref_loader, eval_model, str((script_dir / "artifacts/ndec_ref").resolve())
         )
         ndec_query_vecs, ndec_query_ids = compute_descriptors_for_loader(
-            ndec_query_loader, eval_model, "artifacts/ndec_query"
+            ndec_query_loader, eval_model, str((script_dir / "artifacts/ndec_query").resolve())
         )
         ndec_gt_map = load_ndec_groundtruth_map(ndec_cfg.root, drop_missing=True)
 
@@ -870,7 +1116,7 @@ def main():
         sys.stdout.flush()
 
     if did_train and rank == 0:
-        print(f"\n[Training complete] Final checkpoint at {cfg.checkpoint_path}")
+        print(f"\n[Training complete] Final checkpoint at {checkpoint_path}")
 
     cleanup_distributed()
 
