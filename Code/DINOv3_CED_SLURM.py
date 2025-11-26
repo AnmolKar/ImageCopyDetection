@@ -18,6 +18,13 @@ import numpy as np
 from tqdm.auto import tqdm
 import torchvision.transforms as V
 
+code_dir = Path("/home/jowatson/Deep Learning/Code").resolve()
+if str(code_dir) not in sys.path:
+    sys.path.append(str(code_dir))
+    print(f"Added {code_dir} to sys.path")
+else:
+    print(f"Using existing sys.path entry: {code_dir}")
+
 from disc21_loader import (
     Disc21DataConfig,
     build_transforms,
@@ -34,20 +41,6 @@ from ndec_loader import (
     build_default_loaders as build_ndec_loaders,
     load_groundtruth as load_ndec_groundtruth,
 )
-
-
-code_dir = Path("/home/jowatson/Deep Learning/Code").resolve()
-if str(code_dir) not in sys.path:
-    sys.path.append(str(code_dir))
-    print(f"Added {code_dir} to sys.path")
-else:
-    print(f"Using existing sys.path entry: {code_dir}")
-
-from ndec_loader import (
-    NdecDataConfig,
-    build_default_loaders as build_ndec_loaders,
-    load_groundtruth as load_ndec_groundtruth,
- )
 
 # %%
 env_path = Path(__file__).resolve().parent / ".env"
@@ -67,7 +60,6 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
 @dataclass
-
 class ExperimentConfig:
     disc21_root: Path = Path("/home/jowatson/Deep Learning/DISC21")
     ndec_root: Path = Path("/home/jowatson/Deep Learning/NDEC")
@@ -97,7 +89,6 @@ class ExperimentConfig:
 
 
 @dataclass
-
 class NdecConfig:
     root: Path = Path("/home/jowatson/Deep Learning/NDEC")
     img_size_train: int = 224
@@ -105,7 +96,6 @@ class NdecConfig:
     batch_size_pairs: int = 64
     batch_size_eval: int = 64
     num_workers: int = 4
-
 
 cfg = ExperimentConfig()
 print(cfg)
@@ -1164,43 +1154,3 @@ def run_ndec_retrieval_pipeline(topk: int = 10):
 )
     print(f"NDEC metrics: {metrics}")
     return metrics
-
-
-
-# Example usage (disabled by default)
-
-# run_ndec_retrieval_pipeline(topk=10)
-
-# %% [markdown]
-# # (Optional) Save/Load Checkpoints & Precomputed Embeddings
-# 
-# Utility helpers to persist model weights and cached descriptors for faster experimentation across sessions.
-
-# %%
-def save_checkpoint(model: CEDModel, optimizer: torch.optim.Optimizer, path: str):
-    ckpt = {
-
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "config": cfg.__dict__,
-
-    }
-
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(ckpt, path)
-    print(f"Saved checkpoint to {path}")
-
-
-
-
-
-def load_checkpoint(model: CEDModel, optimizer: torch.optim.Optimizer, path: str):
-    ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model"])
-
-    if optimizer is not None and "optimizer" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer"])
-
-    print(f"Restored checkpoint from {path}")
-
-
