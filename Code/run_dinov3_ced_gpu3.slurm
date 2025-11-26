@@ -2,8 +2,7 @@
 #SBATCH --job-name=dinov3_ced_gpu3
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=512G
+#SBATCH --cpus-per-task=32
 #SBATCH --time=7-00:00:00
 #SBATCH --partition=week-long-gpu
 #SBATCH --nodelist=gpu3
