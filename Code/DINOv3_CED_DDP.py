@@ -139,6 +139,11 @@ class ExperimentConfig:
     min_epochs_ndec: int = 5
 
     checkpoint_path: Path = Path("artifacts/checkpoints/ced_model_ddp.pt")
+    encoding_cache_root: Path = Path("artifacts/sinov3_ced_encoding")
+    encoding_chunk_size: int = 1024
+    eval_query_chunk_size: int = 256
+    eval_ref_chunk_size: int = 8192
+    eval_global_pairs_per_query: int = 512
 
 
 # ======================================================================
@@ -1164,17 +1169,27 @@ def main():
 
         eval_model = ddp_model.module  # unwrap CEDModel
 
-        disc_ref_vecs, disc_ref_ids = compute_descriptors_for_loader(
-            ref_loader, eval_model, str((script_dir / "artifacts/disc21_ref").resolve())
-        )
+        encoding_cache_root = (script_dir / cfg.encoding_cache_root).resolve()
+        encoding_cache_root.mkdir(parents=True, exist_ok=True)
+
+        def encode_with_cache(loader: DataLoader, relative_artifact: str):
+            artifact_path = (script_dir / relative_artifact).resolve()
+            return compute_descriptors_for_loader(
+                loader,
+                eval_model,
+                str(artifact_path),
+                checkpoint_root=str(encoding_cache_root),
+                resume=True,
+                chunk_size=cfg.encoding_chunk_size,
+            )
+
+        disc_ref_vecs, disc_ref_ids = encode_with_cache(ref_loader, "artifacts/disc21_ref")
 
         for split_name, q_loader in [("dev", dev_query_loader), ("test", test_query_loader)]:
             print(f"\n[Eval][DISC21-{split_name}] Encoding queries + computing retrieval metrics...")
             sys.stdout.flush()
 
-            q_vecs, q_ids = compute_descriptors_for_loader(
-                q_loader, eval_model, str((script_dir / f"artifacts/disc21_{split_name}_query").resolve())
-            )
+            q_vecs, q_ids = encode_with_cache(q_loader, f"artifacts/disc21_{split_name}_query")
             gt_map = load_disc21_groundtruth_map(split=split_name, root=disc_cfg.root)
 
             metrics = evaluate_retrieval(
@@ -1184,6 +1199,10 @@ def main():
                 ref_ids=disc_ref_ids,
                 gt_map=gt_map,
                 topk_list=[1, 5, 10, 20],
+                device=device,
+                query_chunk_size=cfg.eval_query_chunk_size,
+                ref_chunk_size=cfg.eval_ref_chunk_size,
+                max_global_pairs_per_query=cfg.eval_global_pairs_per_query,
             )
             print(f"[Eval][DISC21-{split_name}] metrics:", metrics)
             sys.stdout.flush()
@@ -1194,12 +1213,8 @@ def main():
         print("\n[Eval][NDEC] Encoding references + queries...")
         sys.stdout.flush()
 
-        ndec_ref_vecs, ndec_ref_ids = compute_descriptors_for_loader(
-            ndec_ref_loader, eval_model, str((script_dir / "artifacts/ndec_ref").resolve())
-        )
-        ndec_query_vecs, ndec_query_ids = compute_descriptors_for_loader(
-            ndec_query_loader, eval_model, str((script_dir / "artifacts/ndec_query").resolve())
-        )
+        ndec_ref_vecs, ndec_ref_ids = encode_with_cache(ndec_ref_loader, "artifacts/ndec_ref")
+        ndec_query_vecs, ndec_query_ids = encode_with_cache(ndec_query_loader, "artifacts/ndec_query")
         ndec_gt_map = load_ndec_groundtruth_map(cfg.ndec_root, drop_missing=True)
 
         ndec_metrics = evaluate_retrieval(
@@ -1209,6 +1224,10 @@ def main():
             ref_ids=ndec_ref_ids,
             gt_map=ndec_gt_map,
             topk_list=[1, 5, 10, 20],
+            device=device,
+            query_chunk_size=cfg.eval_query_chunk_size,
+            ref_chunk_size=cfg.eval_ref_chunk_size,
+            max_global_pairs_per_query=cfg.eval_global_pairs_per_query,
         )
         print("[Eval][NDEC] metrics:", ndec_metrics)
         sys.stdout.flush()
