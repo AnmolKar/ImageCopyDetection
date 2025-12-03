@@ -3,6 +3,7 @@ import sys
 import json
 import warnings
 import inspect
+import gc
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, Tuple, List, Optional
@@ -1186,6 +1187,9 @@ def main():
             )
             print(f"[Eval][DISC21-{split_name}] metrics:", metrics)
             sys.stdout.flush()
+            if split_name == "dev":
+                del q_vecs, q_ids, gt_map, metrics
+                gc.collect()
 
         print("\n[Eval][NDEC] Encoding references + queries...")
         sys.stdout.flush()

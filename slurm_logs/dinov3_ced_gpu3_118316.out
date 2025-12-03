@@ -1,0 +1,37 @@
+Host: gpu3
+Job ID: 118316
+GPUs requested (per node): 3 [fallback to SBATCH --gres]
+Torch processes per node: 3
+OMP_NUM_THREADS set to 10 (CPUS_PER_TASK=32, NPROC_PER_NODE=3)
+Starting run at Wed Dec  3 11:45:12 EST 2025
+Wed Dec  3 11:45:14 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 550.54.15              Driver Version: 550.54.15      CUDA Version: 12.4     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA A30                     On  |   00000000:31:00.0 Off |                    0 |
+| N/A   30C    P0             31W /  165W |       0MiB /  24576MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA A30                     On  |   00000000:4B:00.0 Off |                    0 |
+| N/A   30C    P0             29W /  165W |       0MiB /  24576MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA A30                     On  |   00000000:CA:00.0 Off |                    0 |
+| N/A   29C    P0             29W /  165W |       0MiB /  24576MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+Launching torchrun at Wed Dec  3 11:45:15 EST 2025
+Config: ExperimentConfig(disc21_root=PosixPath('/home/jowatson/Deep Learning/DISC21'), ndec_root=PosixPath('/home/jowatson/Deep Learning/NDEC'), model_name='facebook/dinov3-vitb16-pretrain-lvd1689m', img_size_train=224, img_size_eval=224, batch_size_train=32, batch_size_eval=32, batch_size_pairs=32, num_workers=4, lr_backbone=1e-05, lr_head=0.0001, weight_decay=0.0001, temperature_ntxent=0.2, temperature_kl=0.1, lambda_kl=1.0, lambda_local=1.0, lambda_bce=1.0, lambda_asl_mtr=1.0, num_epochs_disc21=30, num_epochs_ndec=20, early_stopping_patience_disc21=4, early_stopping_min_delta_disc21=5e-05, min_epochs_disc21=15, early_stopping_patience_ndec=2, early_stopping_min_delta_ndec=5e-05, min_epochs_ndec=5, checkpoint_path=PosixPath('artifacts/checkpoints/ced_model_ddp.pt'))
+World size: 3 | Rank: 0 | Local rank: 0

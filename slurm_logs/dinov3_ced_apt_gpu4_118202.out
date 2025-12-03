@@ -77,3 +77,5 @@ NDEC negative pairs batches (per rank): 1,563
 [Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_apt_model_ddp.pt
 [DISC21][Epoch 21] avg loss across ranks = 0.6789, BCE accuracy = 0.9825
 [Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_apt_model_ddp.pt
+[DISC21][Epoch 22] avg loss across ranks = 0.6730, BCE accuracy = 0.9827
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_apt_model_ddp.pt

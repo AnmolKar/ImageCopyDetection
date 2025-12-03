@@ -45,3 +45,5 @@ NDEC negative pairs batches (per rank): 1,042
 [Logs] Wrote training curves to /home/jowatson/Deep Learning/Code/artifacts/logs/training_curves.json
 
 [Eval] Starting DISC21 + NDEC evaluation with eval_utils metrics (µAP, R@P90).
+
+[Eval][DISC21-dev] Encoding queries + computing retrieval metrics...
