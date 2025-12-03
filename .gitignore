@@ -3,3 +3,6 @@ DISC21/
 NDEC/
 *.env
 *.pt
+
+# Ignore all Slurm outputs (can be very large)
+slurm_logs/*
