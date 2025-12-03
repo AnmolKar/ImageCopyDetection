@@ -3,6 +3,10 @@ DISC21/
 NDEC/
 *.env
 *.pt
+*.pyc
+
 
 # Ignore all Slurm outputs (can be very large)
 slurm_logs/*
+Code/artifacts/*
+Code/Utilities/__pycache__/eval_utils.cpython-312.pyc
