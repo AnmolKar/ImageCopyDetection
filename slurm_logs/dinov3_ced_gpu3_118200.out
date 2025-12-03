@@ -1,0 +1,91 @@
+Host: gpu3
+Job ID: 118200
+GPUs requested (per node): 3 [fallback to SBATCH --gres]
+Torch processes per node: 3
+OMP_NUM_THREADS set to 10 (CPUS_PER_TASK=32, NPROC_PER_NODE=3)
+Starting run at Tue Dec  2 17:57:15 EST 2025
+Tue Dec  2 17:57:17 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 550.54.15              Driver Version: 550.54.15      CUDA Version: 12.4     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA A30                     On  |   00000000:31:00.0 Off |                    0 |
+| N/A   31C    P0             31W /  165W |       0MiB /  24576MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA A30                     On  |   00000000:4B:00.0 Off |                    0 |
+| N/A   30C    P0             29W /  165W |       0MiB /  24576MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA A30                     On  |   00000000:CA:00.0 Off |                    0 |
+| N/A   30C    P0             29W /  165W |       0MiB /  24576MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+Launching torchrun at Tue Dec  2 17:57:18 EST 2025
+Config: ExperimentConfig(disc21_root=PosixPath('/home/jowatson/Deep Learning/DISC21'), ndec_root=PosixPath('/home/jowatson/Deep Learning/NDEC'), model_name='facebook/dinov3-vitb16-pretrain-lvd1689m', img_size_train=224, img_size_eval=224, batch_size_train=32, batch_size_eval=32, batch_size_pairs=32, num_workers=4, lr_backbone=1e-05, lr_head=0.0001, weight_decay=0.0001, temperature_ntxent=0.2, temperature_kl=0.1, lambda_kl=1.0, lambda_local=1.0, lambda_bce=1.0, lambda_asl_mtr=1.0, num_epochs_disc21=30, num_epochs_ndec=20, early_stopping_patience_disc21=4, early_stopping_min_delta_disc21=5e-05, min_epochs_disc21=15, early_stopping_patience_ndec=2, early_stopping_min_delta_ndec=5e-05, min_epochs_ndec=5, checkpoint_path=PosixPath('artifacts/checkpoints/ced_model_ddp.pt'))
+World size: 3 | Rank: 0 | Local rank: 0
+[DataLoader] Using num_workers=16, prefetch_factor=2, persistent_workers=True
+Train images: 1,000,000
+NDEC negative pairs batches (per rank): 1,042
+[Checkpoint] Loaded checkpoint from /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[Checkpoint] Resuming from DISC21 epoch 29 and NDEC epoch 0
+[DISC21] Resuming from epoch 30
+[DISC21][Epoch 30] avg loss across ranks = 0.6178, BCE accuracy = 0.9837
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC] Starting ASL fine-tuning with DDP on all ranks.
+[NDEC][Epoch 1] avg ASL loss (global) = 1.6439
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 2] avg ASL loss (global) = 1.5820
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 3] avg ASL loss (global) = 1.5598
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 4] avg ASL loss (global) = 1.5477
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 5] avg ASL loss (global) = 1.5379
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 6] avg ASL loss (global) = 1.5261
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 7] avg ASL loss (global) = 1.5183
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 8] avg ASL loss (global) = 1.5101
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 9] avg ASL loss (global) = 1.5025
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 10] avg ASL loss (global) = 1.4974
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 11] avg ASL loss (global) = 1.4914
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 12] avg ASL loss (global) = 1.4862
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 13] avg ASL loss (global) = 1.4810
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 14] avg ASL loss (global) = 1.4760
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 15] avg ASL loss (global) = 1.4726
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 16] avg ASL loss (global) = 1.4678
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 17] avg ASL loss (global) = 1.4651
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 18] avg ASL loss (global) = 1.4614
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 19] avg ASL loss (global) = 1.4577
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[NDEC][Epoch 20] avg ASL loss (global) = 1.4551
+[Rank 0] Saved checkpoint to /home/jowatson/Deep Learning/Code/artifacts/checkpoints/ced_model_ddp.pt
+[Logs] Wrote training curves to /home/jowatson/Deep Learning/Code/artifacts/logs/training_curves.json
+
+[Eval] Starting DISC21 + NDEC evaluation with eval_utils metrics (µAP, R@P90).
+
+[Eval][DISC21-dev] Encoding queries + computing retrieval metrics...

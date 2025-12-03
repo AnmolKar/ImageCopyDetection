@@ -1,6 +1,5 @@
 # Ignore large dataset directories
 DISC21/
 NDEC/
-*.err
-*.out
 *.env
+*.pt

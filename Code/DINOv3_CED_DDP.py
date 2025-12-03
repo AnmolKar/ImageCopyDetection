@@ -685,9 +685,11 @@ def main():
     # DDP: distributed sampler for training
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
 
-    # Dynamically choose num_workers for loaders
+    # Choose num_workers for loaders. Use config as a safe upper bound to
+    # avoid excessive per-process CPU/memory use that can trigger OOMs.
     cpu_count = os.cpu_count() or 8
-    num_workers = min(16, max(4, cpu_count // max(world_size, 1)))
+    # Respect the value in config (default small) but don't exceed available CPU quota
+    num_workers = min(cfg.num_workers, max(2, cpu_count // max(world_size, 1)))
 
     if rank == 0:
         print(f"[DataLoader] Using num_workers={num_workers}, prefetch_factor=2, persistent_workers=True")
@@ -699,7 +701,7 @@ def main():
         sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=True,
+        persistent_workers=False,
         prefetch_factor=2,
     )
 
@@ -715,7 +717,7 @@ def main():
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=False,
             prefetch_factor=2,
         )
         dev_query_loader = DataLoader(
@@ -724,7 +726,7 @@ def main():
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=False,
             prefetch_factor=2,
         )
         test_query_loader = DataLoader(
@@ -733,7 +735,7 @@ def main():
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=False,
             prefetch_factor=2,
         )
     else:

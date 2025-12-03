@@ -3,6 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
+#SBATCH --mem=96G
 #SBATCH --time=7-00:00:00
 #SBATCH --partition=week-long-gpu
 #SBATCH --nodelist=gpu3
