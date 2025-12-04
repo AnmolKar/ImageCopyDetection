@@ -1,7 +1,5 @@
 # %% [markdown]
 # # NDEC Dataset Downloader
-# Use this notebook to fetch the NDEC training, query, and ground-truth assets into `/home/jowatson/Deep Learning/NDEC`. Run the cells in order; each download and extraction step shows a progress bar so you can monitor long transfers.
-
 from __future__ import annotations
 
 import argparse
@@ -13,6 +11,7 @@ import tarfile
 import zipfile
 
 from typing import Iterable, List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from tqdm.auto import tqdm
@@ -49,7 +48,7 @@ def stream_download(url: str, destination: Path, chunk_size: int = 1 << 20) -> P
         progress.close()
     return destination
 
-# %%
+
 def download_google_file(url: str, destination: Path) -> Path:
     """Download a Google Drive share link using gdown with progress."""
     ensure_gdown()
@@ -82,6 +81,7 @@ def extract_archive(archive_path: Path, destination: Path) -> None:
     else:
         tqdm.write(f"Skipping extraction for {archive_path.name}: unsupported archive type.")
 
+
 DATASETS: List[Dict[str, str]] = [
     {
         "name": "Training set 1",
@@ -101,12 +101,12 @@ DATASETS: List[Dict[str, str]] = [
         "filename": "negative_pair.tar.ac",
         "protocol": "http",
     },
-    # {
-    #     "name": "Query set",
-    #     "url": "https://huggingface.co/datasets/WenhaoWang/ASL/resolve/main/query_images_h5.tar",
-    #     "filename": "query_images_h5.tar",
-    #     "protocol": "http",
-    # },
+    {
+        "name": "Query set",
+        "url": "https://huggingface.co/datasets/WenhaoWang/ASL/resolve/main/query_images_h5.tar",
+        "filename": "query_images_h5.tar",
+        "protocol": "http",
+    },
 ]
 
 
@@ -139,39 +139,70 @@ def select_datasets(
     return selected
 
 
-def download_all(target_dir: Path, datasets: Iterable[Dict[str, str]]) -> None:
+def _download_and_extract(item: Dict[str, str], target_dir: Path) -> None:
+    """Download a single dataset item and extract it if it's an archive."""
+    target_file = target_dir / item["filename"]
+    tqdm.write(f"\n=== {item['name']} ===")
+
+    if target_file.exists():
+        tqdm.write(f"{target_file.name} already exists, skipping download.")
+    else:
+        if item["protocol"] == "http":
+            stream_download(item["url"], target_file)
+        elif item["protocol"] == "gdrive":
+            download_google_file(item["url"], target_file)
+        else:
+            raise ValueError(f"Unsupported protocol: {item['protocol']}")
+
+    suffixes = "".join(target_file.suffixes)
+    is_tar_archive = suffixes.endswith(
+        (".tar", ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz")
+    )
+    is_zip_archive = suffixes.endswith(".zip")
+    should_extract = is_tar_archive or is_zip_archive
+    if not should_extract:
+        tqdm.write(f"Skipping extraction for {target_file.name} (not an archive).")
+        return
+
+    extraction_dir = target_dir / item["name"].lower().replace(" ", "_")
+    try:
+        extract_archive(target_file, extraction_dir)
+    except (tarfile.TarError, zipfile.BadZipFile) as err:
+        tqdm.write(f"Could not extract {target_file.name}: {err}")
+
+
+def download_all(
+    target_dir: Path,
+    datasets: Iterable[Dict[str, str]],
+    max_workers: int = 3,
+) -> None:
+    """Download and extract all datasets, using multithreading per job."""
     target_dir.mkdir(parents=True, exist_ok=True)
     LOG.info("Downloads will be stored in: %s", target_dir)
 
-    for item in datasets:
-        target_file = target_dir / item["filename"]
-        tqdm.write(f"\n=== {item['name']} ===")
+    datasets_list = list(datasets)
+    if not datasets_list:
+        LOG.info("No datasets to download.")
+        return
 
-        if target_file.exists():
-            tqdm.write(f"{target_file.name} already exists, skipping download.")
-        else:
-            if item["protocol"] == "http":
-                stream_download(item["url"], target_file)
-            elif item["protocol"] == "gdrive":
-                download_google_file(item["url"], target_file)
-            else:
-                raise ValueError(f"Unsupported protocol: {item['protocol']}")
+    # Guard max_workers
+    max_workers = max(1, min(max_workers, len(datasets_list)))
 
-        suffixes = "".join(target_file.suffixes)
-        is_tar_archive = suffixes.endswith(
-            (".tar", ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz")
-        )
-        is_zip_archive = suffixes.endswith(".zip")
-        should_extract = is_tar_archive or is_zip_archive
-        if not should_extract:
-            tqdm.write(f"Skipping extraction for {target_file.name} (not an archive).")
-            continue
+    LOG.info("Using up to %s worker thread(s) for downloads.", max_workers)
 
-        extraction_dir = target_dir / item["name"].lower().replace(" ", "_")
-        try:
-            extract_archive(target_file, extraction_dir)
-        except (tarfile.TarError, zipfile.BadZipFile) as err:
-            tqdm.write(f"Could not extract {target_file.name}: {err}")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_item = {
+            executor.submit(_download_and_extract, item, target_dir): item
+            for item in datasets_list
+        }
+
+        for _ in tqdm(as_completed(future_to_item), total=len(future_to_item), desc="Datasets"):
+            future = _
+            item = future_to_item[future]
+            try:
+                future.result()
+            except Exception as e:
+                LOG.error("Error processing %s: %s", item.get("name", "?"), e)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -194,6 +225,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Total number of shards when running in parallel.",
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=3,
+        help="Maximum number of concurrent download/extract worker threads.",
+    )
     return parser.parse_args(argv)
 
 
@@ -212,12 +249,10 @@ def main(argv: list[str] | None = None) -> int:
         LOG.info("No datasets assigned to this shard. Exiting.")
         return 0
 
-    download_all(args.target_dir, datasets)
+    download_all(args.target_dir, datasets, max_workers=args.max_workers)
     LOG.info("Download job finished successfully.")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-

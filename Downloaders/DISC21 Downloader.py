@@ -191,6 +191,9 @@ def process_entry(entry: ManifestEntry, cfg: DownloadConfig) -> None:
         extraction_dir = make_extract_dir(cfg.output_dir, target_path)
         LOG.info("Extracting %s to %s", target_path.name, extraction_dir)
         extract_archive(target_path, extraction_dir, reextract=cfg.reextract, show_progress=cfg.show_progress)
+        LOG.info("Deleting archive %s", target_path.name)
+        target_path.unlink()
+        LOG.info("Deleted %s", target_path.name)
 
 
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:

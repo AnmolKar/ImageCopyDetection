@@ -9,4 +9,5 @@ NDEC/
 # Ignore all Slurm outputs (can be very large)
 slurm_logs/*
 Code/artifacts/*
-Code/Utilities/__pycache__/eval_utils.cpython-312.pyc
+slurm_logs_archive/*
+Code/Utilities/__pycache__/disc21_loader.cpython-312.pyc
