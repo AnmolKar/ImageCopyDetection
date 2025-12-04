@@ -1,22 +1,36 @@
+"""
+CED Evaluation Library
+======================
+
+Unified evaluation library for Copy-Edit Detection combining:
+1. Descriptor computation and caching
+2. Two-stage CED evaluation (patch + classifier)
+3. Descriptor-only baseline evaluation
+4. Metrics computation (µAP, R@P90, Recall@K, mAP@K)
+5. Runtime benchmarking
+
+"""
+
 import json
 import shutil
+import warnings
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+import torchvision.transforms.functional as TF
+from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
 
-# -----------------------------
-# Descriptor computation (with optional TTA)
-# -----------------------------
+# ============================================================================
+# PART 1: Descriptor Computation and Caching
+# ============================================================================
 
 def _load_checkpoint_state(state_path: Path, checkpoint_dir: Path) -> Dict:
     """Best-effort load of descriptor checkpoint metadata."""
-
     if state_path.exists():
         try:
             with state_path.open("r") as f:
@@ -90,7 +104,6 @@ def compute_descriptors_for_loader(
         checkpointing is enabled. Smaller values reduce recomputation after a
         crash at the cost of more files.
     """
-
     prefix_path = Path(save_path_prefix)
     prefix_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -267,72 +280,9 @@ def compute_descriptors_for_loader(
     return all_vecs, all_ids
 
 
-def compute_descriptors_for_loader_tta(
-    loader: DataLoader,
-    model,
-    save_path_prefix: str,
-    num_views: int = 1,
-    aug=None,
-) -> Tuple[torch.Tensor, List[str]]:
-    """
-    Encode loader with test-time augmentation.
-    If num_views > 1, average descriptors over multiple stochastic views.
-
-    Args:
-      loader: yields (images, sample_ids)
-      model: has encode_images(images) -> (descriptors, aux)
-      num_views: number of stochastic transformations per image
-      aug: a torchvision transform applied per view on CPU tensors
-    """
-    if num_views < 1:
-        num_views = 1
-
-    prefix_path = Path(save_path_prefix)
-    prefix_path.parent.mkdir(parents=True, exist_ok=True)
-
-    all_vecs: List[torch.Tensor] = []
-    all_ids: List[str] = []
-
-    model.eval()
-    device = next(model.parameters()).device
-
-    with torch.no_grad():
-        for imgs, sample_ids in tqdm(loader, desc=f"TTA x{num_views}: {prefix_path.stem}"):
-            imgs = imgs.to(device)
-
-            if num_views == 1 or aug is None:
-                desc, _ = model.encode_images(imgs)
-            else:
-                views = []
-                imgs_cpu = imgs.detach().cpu()
-                for _ in range(num_views):
-                    aug_imgs = torch.stack([aug(img) for img in imgs_cpu]).to(device)
-                    desc_v, _ = model.encode_images(aug_imgs)
-                    views.append(desc_v)
-                desc = torch.stack(views, dim=0).mean(dim=0)
-
-            desc = desc.float().cpu()
-            if not torch.isfinite(desc).all():
-                raise RuntimeError(
-                    f"Non-finite descriptors encountered in compute_descriptors_for_loader_tta "
-                    f"for prefix {save_path_prefix}"
-                )
-
-            all_vecs.append(desc)
-            all_ids.extend([str(sid) for sid in sample_ids])
-
-    if not all_vecs:
-        return torch.empty(0), []
-
-    all_vecs = torch.cat(all_vecs, dim=0)
-    torch.save(all_vecs, f"{save_path_prefix}_tta{num_views}_embeddings.pt")
-    np.save(f"{save_path_prefix}_tta{num_views}_ids.npy", np.array(all_ids))
-    return all_vecs, all_ids
-
-
-# -----------------------------
-# Metrics: cosine sim, µAP, R@P90, Recall@K, mAP@K
-# -----------------------------
+# ============================================================================
+# PART 2: Metrics Computation
+# ============================================================================
 
 def cosine_similarity(queries: torch.Tensor, refs: torch.Tensor) -> torch.Tensor:
     """
@@ -354,17 +304,20 @@ def compute_muap_and_rp90(
 
     all_scores: shape [N_pairs]
     all_labels: shape [N_pairs], in {0,1}
+
+    Returns:
+        Dictionary with keys 'micro_ap' and 'recall_at_p90'
     """
     assert all_scores.shape == all_labels.shape
 
-    # sort by score descending
+    # Sort by score descending
     order = np.argsort(all_scores)[::-1]
     sorted_labels = all_labels[order]
 
     cum_pos = np.cumsum(sorted_labels)
     total_pos = float(sorted_labels.sum())
     if total_pos == 0:
-        return {"muAP": 0.0, "R@P90": 0.0}
+        return {"micro_ap": 0.0, "recall_at_p90": 0.0}
 
     ranks = np.arange(1, len(sorted_labels) + 1)
     precision = cum_pos / ranks
@@ -377,7 +330,7 @@ def compute_muap_and_rp90(
     mask = precision >= 0.9
     rp90 = float(recall[mask].max()) if mask.any() else 0.0
 
-    return {"muAP": muap, "R@P90": rp90}
+    return {"micro_ap": muap, "recall_at_p90": rp90}
 
 
 def evaluate_retrieval(
@@ -393,7 +346,7 @@ def evaluate_retrieval(
     max_global_pairs_per_query: int = 512,
 ) -> Dict[str, float]:
     """
-    Memory-safe retrieval metrics over very large reference sets.
+    Memory-safe descriptor-only retrieval metrics over very large reference sets.
 
     Computes per-query Recall@k / mAP@k exactly, and global µAP / R@P90 using
     all positives plus the top ``max_global_pairs_per_query`` negatives per
@@ -401,7 +354,6 @@ def evaluate_retrieval(
     the decision thresholds of interest (low-scoring negatives do not affect the
     ranking of true positives).
     """
-
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -418,8 +370,8 @@ def evaluate_retrieval(
         for k in topk_list:
             empty_metrics[f"Recall@{k}"] = 0.0
             empty_metrics[f"mAP@{k}"] = 0.0
-        empty_metrics["muAP"] = 0.0
-        empty_metrics["R@P90"] = 0.0
+        empty_metrics["micro_ap"] = 0.0
+        empty_metrics["recall_at_p90"] = 0.0
         return empty_metrics
 
     topk_max = min(max(topk_list), num_refs)
@@ -574,15 +526,312 @@ def evaluate_retrieval(
         global_labels_arr = np.concatenate(global_labels_parts)
         metrics.update(compute_muap_and_rp90(global_scores_arr, global_labels_arr))
     else:
-        metrics["muAP"] = 0.0
-        metrics["R@P90"] = 0.0
+        metrics["micro_ap"] = 0.0
+        metrics["recall_at_p90"] = 0.0
 
     return metrics
 
 
-# -----------------------------
-# Runtime benchmark
-# -----------------------------
+# ============================================================================
+# PART 3: Patch Generation for Two-Stage Evaluation
+# ============================================================================
+
+def make_six_patches(img: torch.Tensor) -> List[torch.Tensor]:
+    """
+    Generate 6 overlapping patches from a square image.
+
+    Strategy:
+    - Patch 0: Full image (global context)
+    - Patches 1-4: Four 75% crops from corners (overlapping quadrants)
+    - Patch 5: Center 75% crop
+
+    Args:
+        img: [C, H, W] tensor, assumed H == W (e.g., 224x224)
+
+    Returns:
+        List of 6 patches, each [C, H, W]
+    """
+    C, H, W = img.shape
+    if H != W:
+        warnings.warn(f"Expected square image, got {H}x{W}. Using min(H,W) as size.")
+        size = min(H, W)
+    else:
+        size = H
+
+    patches = []
+
+    # Patch 0: Full image (identity)
+    patches.append(img)
+
+    # Define crop size (75% of original)
+    crop_size = int(size * 0.75)
+    step = size - crop_size
+
+    # Patches 1-4: Corner crops
+    # 1: Top-left
+    p1 = TF.crop(img, top=0, left=0, height=crop_size, width=crop_size)
+    patches.append(TF.resize(p1, [size, size]))
+
+    # 2: Top-right
+    p2 = TF.crop(img, top=0, left=step, height=crop_size, width=crop_size)
+    patches.append(TF.resize(p2, [size, size]))
+
+    # 3: Bottom-left
+    p3 = TF.crop(img, top=step, left=0, height=crop_size, width=crop_size)
+    patches.append(TF.resize(p3, [size, size]))
+
+    # 4: Bottom-right
+    p4 = TF.crop(img, top=step, left=step, height=crop_size, width=crop_size)
+    patches.append(TF.resize(p4, [size, size]))
+
+    # Patch 5: Center crop
+    offset = (size - crop_size) // 2
+    p5 = TF.crop(img, top=offset, left=offset, height=crop_size, width=crop_size)
+    patches.append(TF.resize(p5, [size, size]))
+
+    return patches
+
+
+def make_six_patches_batch(batch_imgs: torch.Tensor) -> Tuple[torch.Tensor, List[int]]:
+    """
+    Generate 6 patches for each image in a batch.
+
+    Args:
+        batch_imgs: [B, C, H, W] batch of images
+
+    Returns:
+        patches: [B*6, C, H, W] flattened patches
+        patch_to_query: List of length B*6, mapping each patch to its original query index
+    """
+    B, C, H, W = batch_imgs.shape
+    all_patches = []
+    patch_to_query = []
+
+    for i in range(B):
+        patches_i = make_six_patches(batch_imgs[i])
+        all_patches.extend(patches_i)
+        patch_to_query.extend([i] * len(patches_i))
+
+    patches_tensor = torch.stack(all_patches, dim=0)
+    return patches_tensor, patch_to_query
+
+
+def build_ref_index_map(ref_ds: Dataset) -> Dict[str, int]:
+    """
+    Build a mapping from normalized reference IDs to dataset indices.
+
+    Args:
+        ref_ds: Reference dataset (assumed to return (img, sample_id) tuples)
+
+    Returns:
+        Dictionary mapping ref_id_norm -> dataset index
+    """
+    mapping = {}
+    for idx in range(len(ref_ds)):
+        try:
+            _, sample_id = ref_ds[idx]
+            ref_id_norm = Path(str(sample_id)).stem
+            mapping[ref_id_norm] = idx
+        except Exception as e:
+            warnings.warn(f"Failed to index reference {idx}: {e}")
+            continue
+
+    return mapping
+
+
+def normalize_id(img_id: str) -> str:
+    """Normalize image ID by extracting stem (removing path and extension)."""
+    return Path(str(img_id)).stem
+
+
+# ============================================================================
+# PART 4: CED Two-Stage Evaluation
+# ============================================================================
+
+def ced_two_stage_eval(
+    model,  # CEDModel
+    query_loader: DataLoader,
+    ref_vecs: torch.Tensor,
+    ref_ids: List[str],
+    ref_ds: Dataset,
+    gt_map: Dict[str, List[str]],
+    k_candidates: int = 10,
+    device: torch.device = torch.device("cuda"),
+    verbose: bool = True,
+) -> Dict[str, float]:
+    """
+    Run the full CED two-stage evaluation pipeline.
+
+    Pipeline:
+    1. For each query image:
+       a. Generate 6 patches
+       b. Encode patch descriptors
+       c. Retrieve top-k reference candidates per patch (using descriptor similarity)
+       d. Union candidates across patches
+       e. Run CopyEditClassifier on (patch_tokens, ref_tokens) for all patch×candidate pairs
+       f. Aggregate via max-over-patches per (query, ref) pair
+    2. Compute µAP and R@P90 over all (query, ref) pairs
+
+    Args:
+        model: CEDModel with backbone, aggregator, and classifier
+        query_loader: DataLoader for query images
+        ref_vecs: [N_refs, D] precomputed normalized reference descriptors
+        ref_ids: List of reference IDs (aligned with ref_vecs)
+        ref_ds: Reference dataset (for loading images by ID)
+        gt_map: Ground truth mapping {query_id -> [ref_ids]}
+        k_candidates: Number of top candidates to retrieve per patch (paper uses 10)
+        device: Device for computation
+        verbose: Whether to show progress bars
+
+    Returns:
+        Dictionary with keys: 'micro_ap', 'recall_at_p90'
+    """
+    model.eval()
+    ref_vecs = F.normalize(ref_vecs.float(), dim=-1).to(device)
+
+    # Build reference index map
+    if verbose:
+        print(f"[CED Eval] Building reference index map...")
+    ref_index_map = build_ref_index_map(ref_ds)
+    ref_ids_norm = [normalize_id(rid) for rid in ref_ids]
+
+    # Containers for all (query, ref) pairs across the dataset
+    all_pair_scores = []
+    all_pair_labels = []
+
+    with torch.no_grad():
+        iterator = tqdm(query_loader, desc="[CED Eval] Processing queries") if verbose else query_loader
+
+        for batch_imgs, batch_q_ids in iterator:
+            batch_imgs = batch_imgs.to(device)
+            B = batch_imgs.size(0)
+
+            # Step 1: Generate 6 patches per query
+            patches, patch_to_query = make_six_patches_batch(batch_imgs)  # [B*6, C, H, W]
+            patches = patches.to(device)
+
+            # Step 2: Encode patch descriptors
+            patch_descs, patch_feats = model.encode_images(patches, return_local=False)
+            patch_descs = F.normalize(patch_descs.float(), dim=-1)  # [B*6, D]
+
+            # Step 3: Retrieve top-k candidates per patch
+            # Compute similarity: [B*6, D] @ [D, N_refs] -> [B*6, N_refs]
+            sim_scores = patch_descs @ ref_vecs.t()
+            topk_scores, topk_indices = torch.topk(sim_scores, k=k_candidates, dim=1)  # [B*6, k]
+
+            # Step 4: For each query, collect unique candidate refs across all its patches
+            query_candidates = {i: set() for i in range(B)}
+            for patch_idx, query_idx in enumerate(patch_to_query):
+                cand_refs = topk_indices[patch_idx].tolist()
+                query_candidates[query_idx].update(cand_refs)
+
+            # Step 5: For each query, run classifier on patch×candidate pairs
+            for query_idx in range(B):
+                q_id_str = str(batch_q_ids[query_idx])
+                q_id_norm = normalize_id(q_id_str)
+
+                # Get ground truth refs for this query
+                gt_refs_raw = gt_map.get(q_id_norm, [])
+                gt_refs_norm = {normalize_id(rid) for rid in gt_refs_raw if rid}
+
+                # Get candidate ref indices
+                cand_indices = sorted(query_candidates[query_idx])
+                if not cand_indices:
+                    continue
+
+                # Extract this query's 6 patches
+                query_patch_indices = [i for i, q in enumerate(patch_to_query) if q == query_idx]
+                query_patches = patches[query_patch_indices]  # [6, C, H, W]
+
+                # Encode query patch tokens
+                q_patch_feats = model.backbone.get_features_from_images(
+                    query_patches,
+                    output_attentions=False
+                )
+                q_patch_tokens = q_patch_feats["patch_tokens_flat"]  # [6, N_q, D]
+                num_patches = q_patch_tokens.size(0)
+
+                # Load candidate reference images
+                ref_imgs = []
+                ref_ids_for_cands = []
+                valid_cand_indices = []
+
+                for cand_idx in cand_indices:
+                    ref_id_norm = ref_ids_norm[cand_idx]
+                    if ref_id_norm not in ref_index_map:
+                        warnings.warn(f"Reference {ref_id_norm} not found in ref_index_map")
+                        continue
+
+                    ds_idx = ref_index_map[ref_id_norm]
+                    try:
+                        ref_img, _ = ref_ds[ds_idx]
+                        ref_imgs.append(ref_img)
+                        ref_ids_for_cands.append(ref_id_norm)
+                        valid_cand_indices.append(cand_idx)
+                    except Exception as e:
+                        warnings.warn(f"Failed to load reference {ref_id_norm}: {e}")
+                        continue
+
+                if not ref_imgs:
+                    continue
+
+                # Stack and encode reference tokens
+                ref_imgs_batch = torch.stack(ref_imgs, dim=0).to(device)  # [R, C, H, W]
+                r_feats = model.backbone.get_features_from_images(
+                    ref_imgs_batch,
+                    output_attentions=False
+                )
+                r_tokens = r_feats["patch_tokens_flat"]  # [R, N_r, D]
+                num_refs = r_tokens.size(0)
+
+                # Step 6: Run classifier on all patch×ref pairs
+                # For each patch, compute scores against all refs
+                logits_per_patch = []  # Will be [num_patches, num_refs]
+
+                for patch_idx in range(num_patches):
+                    # Expand query tokens: [1, N_q, D] -> [R, N_q, D]
+                    q_tok_expanded = q_patch_tokens[patch_idx].unsqueeze(0).repeat(num_refs, 1, 1)
+
+                    # Run classifier: [R, N_q, D] x [R, N_r, D] -> [R, 1]
+                    logits = model.classifier(q_tok_expanded, r_tokens)  # [R, 1]
+                    logits_per_patch.append(logits.squeeze(-1))  # [R]
+
+                # Stack: [num_patches, num_refs]
+                logits_matrix = torch.stack(logits_per_patch, dim=0)
+
+                # Step 7: Aggregate via max-over-patches
+                scores_per_ref, _ = logits_matrix.max(dim=0)  # [num_refs]
+
+                # Step 8: Convert to CPU and record scores + labels
+                scores_per_ref_cpu = scores_per_ref.cpu().numpy()
+
+                for ref_local_idx, ref_id_norm in enumerate(ref_ids_for_cands):
+                    score = float(scores_per_ref_cpu[ref_local_idx])
+                    label = 1 if ref_id_norm in gt_refs_norm else 0
+
+                    all_pair_scores.append(score)
+                    all_pair_labels.append(label)
+
+    # Step 9: Compute µAP and R@P90 over all pairs
+    if not all_pair_scores:
+        warnings.warn("No valid pairs found during evaluation!")
+        return {"micro_ap": 0.0, "recall_at_p90": 0.0}
+
+    all_pair_scores = np.array(all_pair_scores, dtype=np.float32)
+    all_pair_labels = np.array(all_pair_labels, dtype=np.int32)
+
+    if verbose:
+        print(f"[CED Eval] Total pairs evaluated: {len(all_pair_scores)}")
+        print(f"[CED Eval] Positive pairs: {all_pair_labels.sum()} ({100*all_pair_labels.mean():.2f}%)")
+
+    metrics = compute_muap_and_rp90(all_pair_scores, all_pair_labels)
+
+    return metrics
+
+
+# ============================================================================
+# PART 5: Runtime Benchmarking
+# ============================================================================
 
 def benchmark_inference(
     model,
@@ -646,3 +895,25 @@ def benchmark_inference(
     ms_per_image = total_time / n_images
     print(f"Avg encode_images time: {ms_per_image:.2f} ms/image")
     return ms_per_image
+
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+__all__ = [
+    # Descriptor computation
+    'compute_descriptors_for_loader',
+    # Metrics
+    'cosine_similarity',
+    'compute_muap_and_rp90',
+    'evaluate_retrieval',
+    # Two-stage evaluation
+    'make_six_patches',
+    'make_six_patches_batch',
+    'build_ref_index_map',
+    'normalize_id',
+    'ced_two_stage_eval',
+    # Benchmarking
+    'benchmark_inference',
+]

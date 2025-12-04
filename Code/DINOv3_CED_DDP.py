@@ -52,13 +52,15 @@ from ndec_loader import (  # type: ignore
     load_groundtruth as load_ndec_groundtruth,
 )
 
-from eval_utils import (
+from ced_evaluation import (
     compute_descriptors_for_loader,
     evaluate_retrieval,
-    compute_descriptors_for_loader_tta,
     cosine_similarity,
     compute_muap_and_rp90,
     benchmark_inference,
+    ced_two_stage_eval,
+    build_ref_index_map,
+    normalize_id,
 )
 
 # ----------------------------------------------------------------------
@@ -108,23 +110,51 @@ class ExperimentConfig:
     disc21_root: Path = WORKSPACE_ROOT / "DISC21"
     ndec_root: Path = WORKSPACE_ROOT / "NDEC"
     model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
+
+    # ==== CHANGED FOR CEDETECTOR ====
+    # Train at 224, eval at 384 (paper: 224 → 384)
     img_size_train: int = 224
-    img_size_eval: int = 224
+    img_size_eval: int = 384
+
+    # Paper uses batch_size = 64, lr = 2e-5 for Adam.
+    # You can lower batch_size if you hit OOM.
     batch_size_train: int = 32
     batch_size_eval: int = 32
     batch_size_pairs: int = 32
+
     num_workers: int = 4  # still used by Disc21DataConfig / NdecDataConfig
-    lr_backbone: float = 1e-5
-    lr_head: float = 1e-4
+
+    # ==== CED AUGMENTATION CONFIG ====
+    # Enable comprehensive CED augmentation pipeline (35 transforms from AugLy + AlbumentationsX)
+    use_ced_augmentations: bool = True
+    ced_min_ops: int = 2  # Minimum augmentation operations per image
+    ced_max_ops: int = 6  # Maximum augmentation operations per image
+    ced_aug_seed: Optional[int] = None  # Random seed for augmentations (None = random)
+
+    # ==== CED EVALUATION CONFIG ====
+    # Enable two-stage evaluation pipeline (patch extraction + classifier)
+    use_ced_two_stage_eval: bool = True
+    ced_k_candidates_per_patch: int = 10  # Top-k candidates per patch (paper uses 10)
+
+    # Paper: Adam lr = 2e-5. We use same LR for backbone+heads.
+    lr_backbone: float = 2e-5
+    lr_head: float = 2e-5
+
     weight_decay: float = 1e-4
-    temperature_ntxent: float = 0.2
-    temperature_kl: float = 0.1
-    lambda_kl: float = 1.0
+
+    # ==== CHANGED FOR CEDETECTOR ====
+    # NT-Xent temperature τ = 0.025
+    temperature_ntxent: float = 0.025
+
+    # Kozachenko–Leonenko entropy weight λ = 0.5
+    lambda_kl: float = 0.5
+
+    # Multi-similarity loss hyperparams (α, β, γ=margin) = (2, 50, 1)
     lambda_local: float = 1.0
     lambda_bce: float = 1.0
     lambda_asl_mtr: float = 1.0
 
-    # Epochs
+    # Epochs (paper uses 30 on ISC)
     num_epochs_disc21: int = 30
     num_epochs_ndec: int = 20
 
@@ -143,7 +173,10 @@ class ExperimentConfig:
     encoding_chunk_size: int = 1024
     eval_query_chunk_size: int = 256
     eval_ref_chunk_size: int = 8192
+
+    # top-N candidate pairs per query for global metrics
     eval_global_pairs_per_query: int = 512
+
 
 
 # ======================================================================
@@ -283,6 +316,25 @@ class CEDFeatureAggregator(nn.Module):
         local = self.proj_loc(local)
         return F.normalize(local, dim=-1)
 
+    # ==== NEW: return cls_global, local, descriptor ====
+    def forward_components(
+        self,
+        cls: torch.Tensor,
+        patch_tokens_flat: torch.Tensor,
+        attn_weights: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Global (CLS) embedding
+        cls_global = self.proj_cls(cls.float())
+        cls_global = F.normalize(cls_global, dim=-1)
+
+        # Local pooled embedding
+        local = self.compute_local_embedding(patch_tokens_flat, attn_weights=attn_weights)
+
+        # Concatenate global + local (paper uses both for matching)
+        descriptor = torch.cat([cls_global, local], dim=-1)
+        descriptor = F.normalize(descriptor, dim=-1)
+        return cls_global, local, descriptor
+
     def forward(
         self,
         cls: torch.Tensor,
@@ -290,13 +342,13 @@ class CEDFeatureAggregator(nn.Module):
         attn_weights: Optional[torch.Tensor] = None,
         return_local: bool = False,
     ) -> torch.Tensor:
-        cls_global = self.proj_cls(cls.float())
-        cls_global = F.normalize(cls_global, dim=-1)
-        local = self.compute_local_embedding(patch_tokens_flat, attn_weights=attn_weights)
-        descriptor = torch.cat([cls_global, local], dim=-1)
-        descriptor = F.normalize(descriptor, dim=-1)
-
+        cls_global, local, descriptor = self.forward_components(
+            cls=cls,
+            patch_tokens_flat=patch_tokens_flat,
+            attn_weights=attn_weights,
+        )
         if return_local:
+            # kept for backwards compatibility if you ever use it directly
             return descriptor, local
         return descriptor
 
@@ -370,17 +422,19 @@ class CEDModel(nn.Module):
         # Run backbone + aggregator in full precision to avoid fp16 overflow/NANs
         with amp.autocast(device_type="cuda", enabled=False):
             feats = self.backbone.get_features_from_images(images, output_attentions=True)
-            agg_out = self.aggregator(
+
+            # ==== CHANGED: use forward_components to get cls, local, descriptor ====
+            cls_global, local, descriptor = self.aggregator.forward_components(
                 cls=feats["cls"],
                 patch_tokens_flat=feats["patch_tokens_flat"],
                 attn_weights=feats.get("attn_cls_to_patches"),
-                return_local=return_local,
             )
+
+        # stash for losses
+        feats["cls_global"] = cls_global                   # z in the paper
         if return_local:
-            descriptor, local = agg_out
-            feats["local_descriptor"] = local
-        else:
-            descriptor = agg_out
+            feats["local_descriptor"] = local              # u in the paper
+
         return descriptor, feats
 
     def score_pair(
@@ -388,7 +442,7 @@ class CEDModel(nn.Module):
         q_images: torch.Tensor,
         r_images: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        # Also keep classification backbone path stable
+        # Classification path can still use patch tokens directly
         with amp.autocast(device_type="cuda", enabled=False):
             q_feats = self.backbone.get_features_from_images(q_images)
             r_feats = self.backbone.get_features_from_images(r_images)
@@ -399,25 +453,48 @@ class CEDModel(nn.Module):
 
 
 # ======================================================================
-# Losses, augmentations (with FP32 + NaN guards)
+# Losses (with FP32 + NaN guards)
 # ======================================================================
-copy_edit_aug = V.Compose(
-    [
-        V.RandomResizedCrop(224, scale=(0.6, 1.0)),  # img_size will be reset in main()
-        V.RandomHorizontalFlip(),
-        V.ColorJitter(0.2, 0.2, 0.2, 0.1),
-        V.RandomGrayscale(p=0.1),
-    ]
-)
 
+# Note: On-the-fly augmentation for positive/negative pairs is now handled
+# by a separate augmentation transform that will be applied in make_positive_negative_pairs.
+# The comprehensive CED augmentation pipeline (35 transforms) is applied during
+# dataset loading for the anchor images. For positive/negative pairs during training,
+# we apply additional on-the-fly copy-edit style augmentations.
 
-def make_positive_negative_pairs(batch_imgs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def make_positive_negative_pairs(
+    batch_imgs: torch.Tensor,
+    copy_edit_aug: Optional[V.Compose] = None
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Create positive and negative pairs from a batch of images.
+
+    Args:
+        batch_imgs: Input batch [B, C, H, W]
+        copy_edit_aug: Optional torchvision transform for on-the-fly augmentation
+
+    Returns:
+        Tuple of (anchor, positive, negative) tensors
+    """
     B = batch_imgs.size(0)
     imgs_cpu = batch_imgs.detach().cpu()
     x_anchor = batch_imgs.to(device, non_blocking=True)
-    x_pos = torch.stack([copy_edit_aug(img) for img in imgs_cpu]).to(device, non_blocking=True)
+
+    # Create positive pairs (same image, different augmentation)
+    if copy_edit_aug is not None:
+        x_pos = torch.stack([copy_edit_aug(img) for img in imgs_cpu]).to(device, non_blocking=True)
+    else:
+        # If no augmentation provided, use anchor as positive (identity)
+        x_pos = x_anchor.clone()
+
+    # Create negative pairs (different images, augmented)
     perm = torch.randperm(B)
-    x_neg = torch.stack([copy_edit_aug(imgs_cpu[i]) for i in perm]).to(device, non_blocking=True)
+    if copy_edit_aug is not None:
+        x_neg = torch.stack([copy_edit_aug(imgs_cpu[i]) for i in perm]).to(device, non_blocking=True)
+    else:
+        # If no augmentation provided, use permuted anchors
+        x_neg = x_anchor[perm]
+
     return x_anchor, x_pos, x_neg
 
 
@@ -440,6 +517,34 @@ def nt_xent_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.2) -
 
     loss = F.cross_entropy(sim, targets)
     return loss
+
+
+def kozachenko_leonenko_loss(z: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    Kozachenko–Leonenko differential entropy estimator term (Equation 5 in the paper).
+    We want each descriptor's nearest neighbour (excluding itself) to be not too close,
+    encouraging more uniform coverage on the hypersphere.
+
+    z: [B, D] global descriptors (CLS projections), already L2-normalized.
+    """
+    z = F.normalize(z.float(), dim=-1)
+    B = z.size(0)
+    if B < 2:
+        return torch.tensor(0.0, device=z.device)
+
+    # Pairwise Euclidean distances
+    dists = torch.cdist(z, z, p=2)  # [B, B]
+
+    # Ignore self-distances by setting diagonal to +inf
+    inf_mask = torch.eye(B, device=z.device, dtype=torch.bool)
+    dists = dists.masked_fill(inf_mask, float("inf"))
+
+    # Nearest neighbour distance for each sample
+    min_dists, _ = dists.min(dim=1)  # [B]
+
+    # log of nearest-neighbour distance, averaged over batch
+    min_dists = min_dists.clamp_min(eps)
+    return min_dists.log().mean()
 
 
 def similarity_kl_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
@@ -468,7 +573,7 @@ def multi_similarity_loss(
     labels: torch.Tensor,
     alpha: float = 2.0,
     beta: float = 50.0,
-    margin: float = 0.5,
+    margin: float = 1.0,
 ) -> torch.Tensor:
     """
     Multi-similarity loss in float32.
@@ -659,8 +764,9 @@ def main():
     # Make checkpoint path relative to script dir
     checkpoint_path = str((script_dir / cfg.checkpoint_path).resolve())
 
-    # Update augment crop size based on config
-    global copy_edit_aug
+    # Create on-the-fly augmentation for positive/negative pair generation during training
+    # This is a lightweight torchvision transform applied to tensors, separate from the
+    # comprehensive CED augmentation pipeline (35 transforms) applied during data loading
     copy_edit_aug = V.Compose(
         [
             V.RandomResizedCrop(cfg.img_size_train, scale=(0.6, 1.0)),
@@ -680,9 +786,21 @@ def main():
         num_workers=cfg.num_workers,
     )
 
+    # Build transforms with optional CED augmentation pipeline
+    if rank == 0:
+        aug_mode = "CED augmentation pipeline (35 transforms)" if cfg.use_ced_augmentations else "simple transforms"
+        print(f"[Augmentation] Using {aug_mode}")
+        if cfg.use_ced_augmentations:
+            print(f"[Augmentation] Random ops per image: [{cfg.ced_min_ops}, {cfg.ced_max_ops}]")
+        sys.stdout.flush()
+
     train_tfms, eval_tfms = build_transforms(
         img_size_train=cfg.img_size_train,
         img_size_eval=cfg.img_size_eval,
+        use_ced_augmentations=cfg.use_ced_augmentations,
+        ced_min_ops=cfg.ced_min_ops,
+        ced_max_ops=cfg.ced_max_ops,
+        seed=cfg.ced_aug_seed,
     )
 
     # DISC21 training dataset
@@ -711,41 +829,61 @@ def main():
         prefetch_factor=2,
     )
 
-    # DISC21 eval datasets (used only on rank 0)
-    if rank == 0:
-        ref_ds = get_reference_dataset(root=disc_cfg.root, transform=eval_tfms)
-        dev_queries_ds = get_query_dataset("dev", root=disc_cfg.root, transform=eval_tfms)
-        test_queries_ds = get_query_dataset("test", root=disc_cfg.root, transform=eval_tfms)
+    # ------------------ DISC21 eval datasets (ALL RANKS) ------------------
+    # Instantiate eval datasets on every rank and shard with DistributedSampler.
+    ref_ds = get_reference_dataset(root=disc_cfg.root, transform=eval_tfms)
+    dev_queries_ds = get_query_dataset("dev", root=disc_cfg.root, transform=eval_tfms)
+    test_queries_ds = get_query_dataset("test", root=disc_cfg.root, transform=eval_tfms)
 
-        ref_loader = DataLoader(
-            ref_ds,
-            batch_size=cfg.batch_size_eval,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=False,
-            prefetch_factor=2,
-        )
-        dev_query_loader = DataLoader(
-            dev_queries_ds,
-            batch_size=cfg.batch_size_eval,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=False,
-            prefetch_factor=2,
-        )
-        test_query_loader = DataLoader(
-            test_queries_ds,
-            batch_size=cfg.batch_size_eval,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=False,
-            prefetch_factor=2,
-        )
-    else:
-        ref_loader = dev_query_loader = test_query_loader = None  # type: ignore
+    ref_sampler = DistributedSampler(
+        ref_ds,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False,
+        drop_last=False,
+    )
+    dev_q_sampler = DistributedSampler(
+        dev_queries_ds,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False,
+        drop_last=False,
+    )
+    test_q_sampler = DistributedSampler(
+        test_queries_ds,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False,
+        drop_last=False,
+    )
+
+    ref_loader = DataLoader(
+        ref_ds,
+        batch_size=cfg.batch_size_eval,
+        sampler=ref_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=False,
+        prefetch_factor=2,
+    )
+    dev_query_loader = DataLoader(
+        dev_queries_ds,
+        batch_size=cfg.batch_size_eval,
+        sampler=dev_q_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=False,
+        prefetch_factor=2,
+    )
+    test_query_loader = DataLoader(
+        test_queries_ds,
+        batch_size=cfg.batch_size_eval,
+        sampler=test_q_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=False,
+        prefetch_factor=2,
+    )
 
     # ---------- NDEC config + loaders ----------
     ndec_cfg = NdecDataConfig()
@@ -871,39 +1009,44 @@ def main():
 
             for imgs, _ in progress:
                 imgs = imgs.to(device, non_blocking=True)
-                x_anchor, x_pos, x_neg = make_positive_negative_pairs(imgs)
+                x_anchor, x_pos, x_neg = make_positive_negative_pairs(imgs, copy_edit_aug=copy_edit_aug)
 
                 optimizer.zero_grad(set_to_none=True)
 
                 # forward + loss with AMP autocast
                 with amp.autocast(device_type="cuda", dtype=torch.float16):
-                    # encode anchor & positive (internally forced to fp32)
+                    # encode anchor & positive
+                    # descriptor is global+local; feats_* carries cls_global + local_descriptor
                     v_anchor, feats_anchor = ddp_model.module.encode_images(x_anchor, return_local=True)
                     v_pos, feats_pos = ddp_model.module.encode_images(x_pos, return_local=True)
 
-                    # OPTIONAL: temporary sanity check
-                    if not torch.isfinite(v_anchor).all() or not torch.isfinite(v_pos).all():
-                        if rank == 0:
-                            print(
-                                "[SANITY] Backbone output has non-finite values. "
-                                f"v_anchor finite={torch.isfinite(v_anchor).all().item()}, "
-                                f"v_pos finite={torch.isfinite(v_pos).all().item()}"
-                            )
-                        optimizer.zero_grad(set_to_none=True)
-                        continue
+                    # ==== NEW: use CLS-only projections z for contrastive + KL ====
+                    z_anchor = feats_anchor["cls_global"]   # [B, D]
+                    z_pos    = feats_pos["cls_global"]      # [B, D]
 
-                    loss_contrast = nt_xent_loss(v_anchor, v_pos, temperature=cfg.temperature_ntxent)
-                    loss_kl = similarity_kl_loss(v_anchor, v_pos, temperature=cfg.temperature_kl)
+                    # Concatenate both views for KL (2B descriptors)
+                    z_all = torch.cat([z_anchor, z_pos], dim=0)
 
+                    # L_SimCLR (NT-Xent, Eq. 3 & 4)
+                    loss_simclr = nt_xent_loss(z_anchor, z_pos, temperature=cfg.temperature_ntxent)
+
+                    # L_KL (Kozachenko–Leonenko entropy term, Eq. 5)
+                    loss_kl = kozachenko_leonenko_loss(z_all)
+
+                    # L_contrast = L_SimCLR + λ L_KL  (Eq. 6)
+                    loss_contrast = loss_simclr + cfg.lambda_kl * loss_kl
+
+                    # ==== Local multi-similarity loss (L_MSL, Eq. 7) ====
                     local_anchor = feats_anchor.get("local_descriptor")
-                    local_pos = feats_pos.get("local_descriptor")
+                    local_pos    = feats_pos.get("local_descriptor")
                     local_embeddings = torch.cat([local_anchor, local_pos], dim=0)
                     batch_ids = torch.arange(local_anchor.size(0), device=local_anchor.device)
                     local_labels = torch.cat([batch_ids, batch_ids], dim=0)
                     loss_local = multi_similarity_loss(local_embeddings, local_labels)
 
+                    # ==== BCE on classifier (L_BCE, Eq. 9) ====
                     anchor_tokens = feats_anchor["patch_tokens_flat"].detach()
-                    pos_tokens = feats_pos["patch_tokens_flat"].detach()
+                    pos_tokens    = feats_pos["patch_tokens_flat"].detach()
 
                     with amp.autocast(device_type="cuda", enabled=False):
                         with torch.no_grad():
@@ -919,12 +1062,8 @@ def main():
 
                     loss_bce = bce_loss(logits.float(), labels.float())
 
-                    loss = (
-                        loss_contrast
-                        + cfg.lambda_kl * loss_kl
-                        + cfg.lambda_local * loss_local
-                        + cfg.lambda_bce * loss_bce
-                    )
+                    # ==== Total loss (Eq. 8): L = L_contrast + L_MSL + L_BCE ====
+                    loss = loss_contrast + cfg.lambda_local * loss_local + cfg.lambda_bce * loss_bce
 
                 # NaN / inf guard with debug
                 if not torch.isfinite(loss):
@@ -935,38 +1074,21 @@ def main():
                         print("[WARN][DISC21] Non-finite loss encountered; skipping batch.")
                         print(
                             "  components finite?:",
-                            f"contrast={finite(loss_contrast)},",
+                            f"simclr={finite(loss_simclr)},",
                             f"kl={finite(loss_kl)},",
                             f"local={finite(loss_local)},",
                             f"bce={finite(loss_bce)}",
                         )
                         try:
-                            print("  loss_contrast:", float(loss_contrast.detach().cpu()))
-                            print("  loss_kl      :", float(loss_kl.detach().cpu()))
-                            print("  loss_local   :", float(loss_local.detach().cpu()))
-                            print("  loss_bce     :", float(loss_bce.detach().cpu()))
+                            print("  loss_simclr :", float(loss_simclr.detach().cpu()))
+                            print("  loss_kl     :", float(loss_kl.detach().cpu()))
+                            print("  loss_local  :", float(loss_local.detach().cpu()))
+                            print("  loss_bce    :", float(loss_bce.detach().cpu()))
                         except Exception as e:
                             print("  [DEBUG] error printing loss components:", e)
-
-                        for name, t in [
-                            ("v_anchor", v_anchor),
-                            ("v_pos", v_pos),
-                            ("local_anchor", local_anchor),
-                            ("local_pos", local_pos),
-                            ("logits_pos", logits_pos),
-                            ("logits_neg", logits_neg),
-                        ]:
-                            if not torch.isfinite(t).all():
-                                finite_vals = t[torch.isfinite(t)]
-                                if finite_vals.numel() > 0:
-                                    t_min = float(finite_vals.min().detach().cpu())
-                                    t_max = float(finite_vals.max().detach().cpu())
-                                else:
-                                    t_min = float("nan")
-                                    t_max = float("nan")
-                                print(f"  [DEBUG] {name} has non-finite values. min={t_min}, max={t_max}")
                     optimizer.zero_grad(set_to_none=True)
                     continue
+
 
                 # Backward with AMP
                 scaler.scale(loss).backward()
@@ -989,7 +1111,8 @@ def main():
                     progress.set_postfix(
                         {
                             "loss": f"{float(loss.detach().cpu()):.4f}",
-                            "contrast": f"{loss_contrast.item():.4f}",
+                            "simclr": f"{loss_simclr.item():.4f}",
+                            "kl": f"{loss_kl.item():.4f}",
                             "local": f"{loss_local.item():.4f}",
                             "bce_acc": f"{batch_acc:.3f}",
                         }
@@ -1162,74 +1285,217 @@ def main():
             )
         print(f"[Logs] Wrote training curves to {curves_path}")
 
-    # ------------------ Evaluation using eval_utils (rank 0 only) ------------------
+    # ------------------ Evaluation (Distributed) ------------------
+    eval_model = ddp_model.module  # unwrap CEDModel
+    encoding_cache_root = (script_dir / cfg.encoding_cache_root).resolve()
+    encoding_cache_root.mkdir(parents=True, exist_ok=True)
+
+    def encode_and_save_rank(loader: DataLoader, relative_artifact_name: str):
+        """Encode loader shard on this rank and persist to a rank-specific folder."""
+
+        rank_root = encoding_cache_root / relative_artifact_name / f"rank_{rank}"
+        rank_root.mkdir(parents=True, exist_ok=True)
+        save_prefix = rank_root / f"rank_{rank}"
+
+        return compute_descriptors_for_loader(
+            loader,
+            eval_model,
+            save_path_prefix=str(save_prefix),
+            checkpoint_root=str(rank_root),
+            resume=True,
+            chunk_size=cfg.encoding_chunk_size,
+        )
+
     if rank == 0:
-        print("\n[Eval] Starting DISC21 + NDEC evaluation with eval_utils metrics (µAP, R@P90).")
+        print("\n[Eval] Starting Distributed Encoding...")
         sys.stdout.flush()
 
-        eval_model = ddp_model.module  # unwrap CEDModel
+    encode_and_save_rank(ref_loader, "disc21_ref")
+    encode_and_save_rank(dev_query_loader, "disc21_dev_query")
+    encode_and_save_rank(test_query_loader, "disc21_test_query")
+    encode_and_save_rank(ndec_ref_loader, "ndec_ref")
+    encode_and_save_rank(ndec_query_loader, "ndec_query")
 
-        encoding_cache_root = (script_dir / cfg.encoding_cache_root).resolve()
-        encoding_cache_root.mkdir(parents=True, exist_ok=True)
+    if rank == 0:
+        print("[Eval] Waiting for all ranks to finish encoding...")
+        sys.stdout.flush()
+    dist.barrier()
 
-        def encode_with_cache(loader: DataLoader, relative_artifact: str):
-            artifact_path = (script_dir / relative_artifact).resolve()
-            return compute_descriptors_for_loader(
-                loader,
-                eval_model,
-                str(artifact_path),
-                checkpoint_root=str(encoding_cache_root),
-                resume=True,
-                chunk_size=cfg.encoding_chunk_size,
+    if rank == 0:
+        print("[Eval] All ranks finished. Merging results and computing metrics...")
+        sys.stdout.flush()
+
+        def load_and_merge_ranks(relative_artifact_name: str):
+            merged_vecs: List[torch.Tensor] = []
+            merged_ids: List[str] = []
+
+            base_path = encoding_cache_root / relative_artifact_name
+
+            for r in range(world_size):
+                rank_folder = base_path / f"rank_{r}" / f"rank_{r}"
+                vec_path = rank_folder / "final_embeddings.pt"
+                id_path = rank_folder / "final_ids.npy"
+
+                if not vec_path.exists() or not id_path.exists():
+                    print(f"[WARN] Missing output for rank {r} at {vec_path}")
+                    continue
+
+                merged_vecs.append(torch.load(vec_path, map_location="cpu"))
+                merged_ids.extend(np.load(id_path, allow_pickle=True).tolist())
+
+            if not merged_vecs:
+                return torch.empty(0), []
+
+            final_vecs = torch.cat(merged_vecs, dim=0)
+
+            unique_map: Dict[str, int] = {}
+            unique_order: List[int] = []
+            for idx, sample_id in enumerate(merged_ids):
+                sid = str(sample_id)
+                if sid in unique_map:
+                    continue
+                unique_map[sid] = idx
+                unique_order.append(idx)
+
+            final_vecs = final_vecs[unique_order]
+            final_ids = [merged_ids[i] for i in unique_order]
+
+            print(
+                f"       Merged {relative_artifact_name}: {len(merged_ids)} -> {len(final_ids)} unique items."
             )
+            return final_vecs.to(device), final_ids
 
-        disc_ref_vecs, disc_ref_ids = encode_with_cache(ref_loader, "artifacts/disc21_ref")
+        disc_ref_vecs, disc_ref_ids = load_and_merge_ranks("disc21_ref")
+        disc_ref_vecs = F.normalize(disc_ref_vecs.float(), dim=-1)
 
-        for split_name, q_loader in [("dev", dev_query_loader), ("test", test_query_loader)]:
-            print(f"\n[Eval][DISC21-{split_name}] Encoding queries + computing retrieval metrics...")
-            sys.stdout.flush()
-
-            q_vecs, q_ids = encode_with_cache(q_loader, f"artifacts/disc21_{split_name}_query")
+        for split_name in ["dev", "test"]:
+            print(f"\n[Eval][DISC21-{split_name}] Computing metrics...")
             gt_map = load_disc21_groundtruth_map(split=split_name, root=disc_cfg.root)
 
-            metrics = evaluate_retrieval(
-                query_vecs=q_vecs,
-                query_ids=q_ids,
-                ref_vecs=disc_ref_vecs,
-                ref_ids=disc_ref_ids,
-                gt_map=gt_map,
+            if cfg.use_ced_two_stage_eval:
+                # Use CED two-stage evaluation (patch + classifier)
+                print(f"[Eval][DISC21-{split_name}] Running CED two-stage pipeline...")
+                print(f"  k_candidates per patch: {cfg.ced_k_candidates_per_patch}")
+
+                # Get the appropriate query loader
+                if split_name == "dev":
+                    query_loader_for_eval = dev_query_loader
+                else:
+                    query_loader_for_eval = test_query_loader
+
+                ced_metrics = ced_two_stage_eval(
+                    model=eval_model,
+                    query_loader=query_loader_for_eval,
+                    ref_vecs=disc_ref_vecs,
+                    ref_ids=disc_ref_ids,
+                    ref_ds=ref_ds,
+                    gt_map=gt_map,
+                    k_candidates=cfg.ced_k_candidates_per_patch,
+                    device=device,
+                    verbose=True,
+                )
+                print(f"[Eval][DISC21-{split_name}] CED two-stage metrics:", ced_metrics)
+
+                # Optionally also compute descriptor-only baseline for comparison
+                print(f"[Eval][DISC21-{split_name}] Computing descriptor-only baseline for comparison...")
+                q_vecs, q_ids = load_and_merge_ranks(f"disc21_{split_name}_query")
+                baseline_metrics = evaluate_retrieval(
+                    query_vecs=q_vecs,
+                    query_ids=q_ids,
+                    ref_vecs=disc_ref_vecs,
+                    ref_ids=disc_ref_ids,
+                    gt_map=gt_map,
+                    topk_list=[1, 5, 10, 20],
+                    device=device,
+                    query_chunk_size=cfg.eval_query_chunk_size,
+                    ref_chunk_size=cfg.eval_ref_chunk_size,
+                    max_global_pairs_per_query=cfg.eval_global_pairs_per_query,
+                )
+                print(f"[Eval][DISC21-{split_name}] Descriptor-only baseline:", baseline_metrics)
+                del q_vecs, q_ids, baseline_metrics
+
+            else:
+                # Use descriptor-only evaluation (old method)
+                q_vecs, q_ids = load_and_merge_ranks(f"disc21_{split_name}_query")
+
+                metrics = evaluate_retrieval(
+                    query_vecs=q_vecs,
+                    query_ids=q_ids,
+                    ref_vecs=disc_ref_vecs,
+                    ref_ids=disc_ref_ids,
+                    gt_map=gt_map,
+                    topk_list=[1, 5, 10, 20],
+                    device=device,
+                    query_chunk_size=cfg.eval_query_chunk_size,
+                    ref_chunk_size=cfg.eval_ref_chunk_size,
+                    max_global_pairs_per_query=cfg.eval_global_pairs_per_query,
+                )
+                print(f"[Eval][DISC21-{split_name}] Descriptor-only metrics:", metrics)
+                del q_vecs, q_ids, metrics
+
+            gc.collect()
+
+        print("\n[Eval][NDEC] Computing metrics...")
+        ndec_ref_vecs, ndec_ref_ids = load_and_merge_ranks("ndec_ref")
+        ndec_ref_vecs = F.normalize(ndec_ref_vecs.float(), dim=-1)
+        ndec_gt_map = load_ndec_groundtruth_map(cfg.ndec_root, drop_missing=True)
+
+        if cfg.use_ced_two_stage_eval:
+            # Use CED two-stage evaluation for NDEC
+            print(f"[Eval][NDEC] Running CED two-stage pipeline...")
+            print(f"  k_candidates per patch: {cfg.ced_k_candidates_per_patch}")
+
+            # Get NDEC ref dataset from loader
+            ndec_ref_ds = ndec_ref_loader.dataset
+
+            ced_ndec_metrics = ced_two_stage_eval(
+                model=eval_model,
+                query_loader=ndec_query_loader,
+                ref_vecs=ndec_ref_vecs,
+                ref_ids=ndec_ref_ids,
+                ref_ds=ndec_ref_ds,
+                gt_map=ndec_gt_map,
+                k_candidates=cfg.ced_k_candidates_per_patch,
+                device=device,
+                verbose=True,
+            )
+            print("[Eval][NDEC] CED two-stage metrics:", ced_ndec_metrics)
+
+            # Optionally compute descriptor-only baseline for comparison
+            print(f"[Eval][NDEC] Computing descriptor-only baseline for comparison...")
+            ndec_query_vecs, ndec_query_ids = load_and_merge_ranks("ndec_query")
+            ndec_baseline_metrics = evaluate_retrieval(
+                query_vecs=ndec_query_vecs,
+                query_ids=ndec_query_ids,
+                ref_vecs=ndec_ref_vecs,
+                ref_ids=ndec_ref_ids,
+                gt_map=ndec_gt_map,
                 topk_list=[1, 5, 10, 20],
                 device=device,
                 query_chunk_size=cfg.eval_query_chunk_size,
                 ref_chunk_size=cfg.eval_ref_chunk_size,
                 max_global_pairs_per_query=cfg.eval_global_pairs_per_query,
             )
-            print(f"[Eval][DISC21-{split_name}] metrics:", metrics)
-            sys.stdout.flush()
-            if split_name == "dev":
-                del q_vecs, q_ids, gt_map, metrics
-                gc.collect()
+            print("[Eval][NDEC] Descriptor-only baseline:", ndec_baseline_metrics)
 
-        print("\n[Eval][NDEC] Encoding references + queries...")
-        sys.stdout.flush()
+        else:
+            # Use descriptor-only evaluation (old method)
+            ndec_query_vecs, ndec_query_ids = load_and_merge_ranks("ndec_query")
 
-        ndec_ref_vecs, ndec_ref_ids = encode_with_cache(ndec_ref_loader, "artifacts/ndec_ref")
-        ndec_query_vecs, ndec_query_ids = encode_with_cache(ndec_query_loader, "artifacts/ndec_query")
-        ndec_gt_map = load_ndec_groundtruth_map(cfg.ndec_root, drop_missing=True)
+            ndec_metrics = evaluate_retrieval(
+                query_vecs=ndec_query_vecs,
+                query_ids=ndec_query_ids,
+                ref_vecs=ndec_ref_vecs,
+                ref_ids=ndec_ref_ids,
+                gt_map=ndec_gt_map,
+                topk_list=[1, 5, 10, 20],
+                device=device,
+                query_chunk_size=cfg.eval_query_chunk_size,
+                ref_chunk_size=cfg.eval_ref_chunk_size,
+                max_global_pairs_per_query=cfg.eval_global_pairs_per_query,
+            )
+            print("[Eval][NDEC] Descriptor-only metrics:", ndec_metrics)
 
-        ndec_metrics = evaluate_retrieval(
-            query_vecs=ndec_query_vecs,
-            query_ids=ndec_query_ids,
-            ref_vecs=ndec_ref_vecs,
-            ref_ids=ndec_ref_ids,
-            gt_map=ndec_gt_map,
-            topk_list=[1, 5, 10, 20],
-            device=device,
-            query_chunk_size=cfg.eval_query_chunk_size,
-            ref_chunk_size=cfg.eval_ref_chunk_size,
-            max_global_pairs_per_query=cfg.eval_global_pairs_per_query,
-        )
-        print("[Eval][NDEC] metrics:", ndec_metrics)
         sys.stdout.flush()
 
     if did_train and rank == 0:

@@ -68,9 +68,52 @@ def build_transforms(
     img_size_train: int = 224,
     img_size_eval: int = 224,
     augment_train: bool = True,
-) -> Tuple[T.Compose, T.Compose]:
-    """Return sensible default torchvision transforms for train/eval."""
+    use_ced_augmentations: bool = False,
+    ced_min_ops: int = 2,
+    ced_max_ops: int = 6,
+    seed: Optional[int] = None,
+) -> Tuple[Callable, Callable]:
+    """
+    Return transforms for train/eval.
 
+    If use_ced_augmentations=True, uses the comprehensive CED augmentation pipeline
+    with 35 transforms from AugLy and AlbumentationsX.
+
+    Otherwise, falls back to simple torchvision transforms.
+
+    Args:
+        img_size_train: Training image size
+        img_size_eval: Evaluation image size
+        augment_train: Whether to use augmentations (only for non-CED pipeline)
+        use_ced_augmentations: Whether to use the comprehensive CED augmentation pipeline
+        ced_min_ops: Minimum augmentation ops per image (CED pipeline only)
+        ced_max_ops: Maximum augmentation ops per image (CED pipeline only)
+        seed: Random seed for reproducibility
+
+    Returns:
+        Tuple of (train_transform, eval_transform) callables
+    """
+    if use_ced_augmentations:
+        # Use the comprehensive CED augmentation pipeline
+        try:
+            from ced_augmentations import build_ced_transforms
+            return build_ced_transforms(
+                img_size_train=img_size_train,
+                img_size_eval=img_size_eval,
+                use_augmentations=True,
+                min_ops=ced_min_ops,
+                max_ops=ced_max_ops,
+                seed=seed,
+            )
+        except ImportError as e:
+            logger.warning(
+                f"Failed to import CED augmentations: {e}. "
+                "Falling back to simple torchvision transforms. "
+                "Install augly and albumentationsx to use CED augmentations."
+            )
+            # Fall through to simple transforms
+
+    # Simple torchvision transforms (default/fallback)
     train_tfms = [T.Resize((img_size_train, img_size_train))]
     if augment_train:
         train_tfms.append(T.RandomHorizontalFlip())
