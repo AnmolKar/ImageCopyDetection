@@ -34,6 +34,9 @@ if str(UTILITIES_DIR) not in sys.path:
 # Model architecture
 from ced_models import DinoV3Backbone, CEDModel
 
+# APT integration
+from apt_ced_wrapper import wrap_ced_with_apt
+
 # Loss functions
 from ced_losses import (
     nt_xent_loss,
@@ -89,6 +92,13 @@ class ExperimentConfig:
     # Image sizes (Paper: 224 train, 384 eval)
     img_size_train: int = 224
     img_size_eval: int = 384
+
+    # APT configuration
+    use_apt: bool = True  # Enable Adaptive Patch Transformers
+    apt_num_scales: int = 3  # Number of patch scales (16, 32, 64)
+    apt_thresholds: List[float] = None  # Auto-set to [5.5, 4.0]
+    apt_scorer_method: str = "entropy"  # 'entropy', 'laplacian', or 'upsampling'
+    apt_analyze_only: bool = True  # Only analyze, don't apply (for compatibility)
 
     # Batch sizes (Paper: 64, reduced to 32 for memory)
     batch_size_train: int = 32
@@ -361,6 +371,23 @@ def main():
     backbone = DinoV3Backbone(model_name=cfg.model_name)
     backbone.model.to(device)
     ced_model = CEDModel(backbone=backbone, dim=backbone.hidden_size).to(device)
+
+    # Wrap with APT if enabled
+    if cfg.use_apt:
+        ced_model = wrap_ced_with_apt(
+            ced_model,
+            enable_apt=True,
+            num_scales=cfg.apt_num_scales,
+            thresholds=cfg.apt_thresholds,
+            scorer_method=cfg.apt_scorer_method,
+        )
+        if rank == 0:
+            print(f"[APT] Wrapped model with Adaptive Patch Transformers")
+            print(f"[APT]   Num scales: {cfg.apt_num_scales}")
+            print(f"[APT]   Thresholds: {cfg.apt_thresholds or [5.5, 4.0]}")
+            print(f"[APT]   Scorer: {cfg.apt_scorer_method}")
+            print(f"[APT]   Analysis mode: {cfg.apt_analyze_only}")
+            sys.stdout.flush()
 
     from torch.nn.parallel import DistributedDataParallel as DDP
     ddp_model = DDP(
@@ -879,6 +906,13 @@ def main():
 
     if did_train and rank == 0:
         print(f"\n[Training complete] Final checkpoint at {checkpoint_path}")
+
+    # Print APT statistics if enabled
+    if cfg.use_apt and rank == 0:
+        print("\n" + "="*70)
+        print("APT Token Reduction Analysis")
+        print("="*70)
+        eval_model.print_stats()
 
     cleanup_distributed()
 
