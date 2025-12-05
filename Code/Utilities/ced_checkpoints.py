@@ -19,7 +19,7 @@ class TrainingState:
     Training state for resumption across epochs.
 
     Tracks progress for both DISC21 and NDEC training phases,
-    including loss history and early stopping counters.
+    including loss history, accuracy history, and early stopping counters.
     """
     epoch_disc21: int = 0
     epoch_ndec: int = 0
@@ -29,6 +29,7 @@ class TrainingState:
     ndec_bad_epochs: int = 0
     disc21_losses: List[float] = field(default_factory=list)
     ndec_losses: List[float] = field(default_factory=list)
+    disc21_accuracies: List[float] = field(default_factory=list)  # BCE accuracy per epoch
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for serialization."""

@@ -266,7 +266,7 @@ class CopyEditClassifier(nn.Module):
     - Linear layer (+ sigmoid in BCE loss)
     """
 
-    def __init__(self, dim: int, num_heads: int = 8, num_layers: int = 2, dropout: float = 0.1):
+    def __init__(self, dim: int, num_heads: int = 8, num_layers: int = 2, dropout: float = 0.1, use_checkpoint: bool = True):
         super().__init__()
         self.cross_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
         self.blocks = nn.ModuleList(
@@ -274,6 +274,7 @@ class CopyEditClassifier(nn.Module):
         )
         self.norm = nn.LayerNorm(dim)
         self.head = nn.Linear(dim, 1)
+        self.use_checkpoint = use_checkpoint
 
     def forward(self, q_tokens: torch.Tensor, r_tokens: torch.Tensor) -> torch.Tensor:
         """
@@ -288,8 +289,14 @@ class CopyEditClassifier(nn.Module):
         r_norm = r_tokens
         cross_out, _ = self.cross_attn(q_norm, r_norm, r_norm)
         x = q_tokens + cross_out
+
+        # Use gradient checkpointing for transformer blocks to save memory
         for block in self.blocks:
-            x = block(x)
+            if self.use_checkpoint and self.training:
+                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
+
         x = self.norm(x)
         x = x.mean(dim=1)  # Global average pooling
         logits = self.head(x)

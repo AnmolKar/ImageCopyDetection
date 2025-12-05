@@ -90,12 +90,15 @@ class ExperimentConfig:
     img_size_train: int = 224
     img_size_eval: int = 384
 
-    # Batch sizes (Paper: 64, reduced to 32 for memory)
-    batch_size_train: int = 32
-    batch_size_eval: int = 32
-    batch_size_pairs: int = 32
+    # Batch sizes (optimized for 2x A30 GPUs on gpu4 with 257GB RAM)
+    batch_size_train: int = 48  # Increased from 32 for speed
+    batch_size_eval: int = 48
+    batch_size_pairs: int = 48
 
-    num_workers: int = 4
+    num_workers: int = 8  # Increased for faster data loading
+
+    # Gradient accumulation for effective larger batch
+    gradient_accumulation_steps: int = 2  # Effective batch = 48 * 2 * 2 GPUs = 192
 
     # CED augmentation config
     use_ced_augmentations: bool = True
@@ -106,6 +109,7 @@ class ExperimentConfig:
     # CED evaluation config
     use_ced_two_stage_eval: bool = True
     ced_k_candidates_per_patch: int = 10  # Paper uses k=10
+    skip_eval_during_training: bool = True  # Skip eval, only eval at end (FAST MODE)
 
     # Learning rates (Paper: 2e-5)
     lr_backbone: float = 2e-5
@@ -119,27 +123,27 @@ class ExperimentConfig:
     lambda_bce: float = 1.0             # L_BCE weight
     lambda_asl_mtr: float = 1.0         # ASL metric weight
 
-    # Training epochs (Paper: 30 on ISC)
-    num_epochs_disc21: int = 30
-    num_epochs_ndec: int = 20
+    # Training epochs (Paper: 30 on ISC) - REDUCED FOR FAST TRAINING
+    num_epochs_disc21: int = 15
+    num_epochs_ndec: int = 5
 
-    # Early stopping (DISC21)
-    early_stopping_patience_disc21: int = 4
-    early_stopping_min_delta_disc21: float = 5e-5
-    min_epochs_disc21: int = 15
+    # Early stopping (DISC21) - REDUCED FOR FASTER TRAINING
+    early_stopping_patience_disc21: int = 2
+    early_stopping_min_delta_disc21: float = 1e-4
+    min_epochs_disc21: int = 3
 
-    # Early stopping (NDEC)
-    early_stopping_patience_ndec: int = 2
-    early_stopping_min_delta_ndec: float = 5e-5
-    min_epochs_ndec: int = 5
+    # Early stopping (NDEC) - REDUCED FOR FASTER TRAINING
+    early_stopping_patience_ndec: int = 1
+    early_stopping_min_delta_ndec: float = 1e-4
+    min_epochs_ndec: int = 2
 
     # Paths
     checkpoint_path: Path = Path("artifacts/checkpoints/ced_model_ddp.pt")
     encoding_cache_root: Path = Path("artifacts/sinov3_ced_encoding")
-    encoding_chunk_size: int = 1024
-    eval_query_chunk_size: int = 256
-    eval_ref_chunk_size: int = 8192
-    eval_global_pairs_per_query: int = 512
+    encoding_chunk_size: int = 1536  # Increased for faster encoding (2 GPUs)
+    eval_query_chunk_size: int = 384  # Increased for faster eval
+    eval_ref_chunk_size: int = 12288  # Increased for faster eval
+    eval_global_pairs_per_query: int = 256  # Reduced to speed up eval
 
 
 # ======================================================================
@@ -396,6 +400,7 @@ def main():
     ndec_bad_epochs = training_state.ndec_bad_epochs
     disc21_losses: List[float] = training_state.disc21_losses
     ndec_losses: List[float] = training_state.ndec_losses
+    disc21_accuracies: List[float] = training_state.disc21_accuracies
 
     # ------------------ Training flags ------------------
     should_train_disc21 = True
@@ -432,12 +437,15 @@ def main():
             epoch_loss = 0.0
             epoch_correct = 0.0
             epoch_total = 0.0
+            accumulation_counter = 0
 
             for imgs, _ in progress:
                 imgs = imgs.to(device, non_blocking=True)
                 x_anchor, x_pos, x_neg = make_positive_negative_pairs(imgs, copy_edit_aug=copy_edit_aug)
 
-                optimizer.zero_grad(set_to_none=True)
+                # Only zero gradients at the start of accumulation cycle
+                if accumulation_counter == 0:
+                    optimizer.zero_grad(set_to_none=True)
 
                 # Forward + loss with AMP autocast
                 with amp.autocast(device_type="cuda", dtype=torch.float16):
@@ -487,20 +495,29 @@ def main():
 
                     # Total loss (Eq 8): L = L_contrast + L_MSL + L_BCE
                     loss = loss_contrast + cfg.lambda_local * loss_local + cfg.lambda_bce * loss_bce
+                    # Scale loss by accumulation steps for proper gradient averaging
+                    loss = loss / cfg.gradient_accumulation_steps
 
                 # NaN / inf guard
                 if not torch.isfinite(loss):
                     if rank == 0:
                         print("[WARN][DISC21] Non-finite loss encountered; skipping batch.")
+                    accumulation_counter = 0
                     optimizer.zero_grad(set_to_none=True)
                     continue
 
-                # Backward with AMP
+                # Backward with AMP (accumulate gradients)
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
+
+                accumulation_counter += 1
+
+                # Only update weights after accumulating gradients
+                if accumulation_counter >= cfg.gradient_accumulation_steps:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    accumulation_counter = 0
 
                 epoch_loss += float(loss.detach().cpu())
 
@@ -540,6 +557,7 @@ def main():
             stop_now = False
             if rank == 0:
                 disc21_losses.append(epoch_loss_avg)
+                disc21_accuracies.append(epoch_acc_global)
                 print(
                     f"[DISC21][Epoch {current_epoch}] avg loss across ranks = {epoch_loss_avg:.4f}, "
                     f"BCE accuracy = {epoch_acc_global:.4f}"
@@ -557,6 +575,7 @@ def main():
                 training_state.best_disc21_loss = best_disc21_loss
                 training_state.disc21_bad_epochs = disc21_bad_epochs
                 training_state.disc21_losses = disc21_losses
+                training_state.disc21_accuracies = disc21_accuracies
 
                 ckpt_manager.save(ddp_model.module, optimizer, training_state)
 
@@ -662,9 +681,17 @@ def main():
         log_dir = (script_dir / "artifacts/logs").resolve()
         log_dir.mkdir(parents=True, exist_ok=True)
         curves_path = log_dir / "training_curves.json"
+
+        training_metrics = {
+            "disc21_losses": disc21_losses,
+            "disc21_accuracies": disc21_accuracies,
+            "ndec_losses": ndec_losses,
+        }
+
         with curves_path.open("w") as f:
-            json.dump({"disc21_losses": disc21_losses, "ndec_losses": ndec_losses}, f, indent=2)
+            json.dump(training_metrics, f, indent=2)
         print(f"[Logs] Wrote training curves to {curves_path}")
+        print(f"[Logs]   DISC21 epochs: {len(disc21_losses)}, NDEC epochs: {len(ndec_losses)}")
 
     # ------------------ Evaluation (Distributed) ------------------
     eval_model = ddp_model.module  # unwrap CEDModel
