@@ -498,10 +498,15 @@ def main():
                     # Scale loss by accumulation steps for proper gradient averaging
                     loss = loss / cfg.gradient_accumulation_steps
 
-                # NaN / inf guard
-                if not torch.isfinite(loss):
+                # NaN / inf guard - synchronize across all ranks to prevent deadlock
+                import torch.distributed as dist
+                is_finite = torch.isfinite(loss)
+                finite_tensor = torch.tensor(1 if is_finite else 0, device=device)
+                dist.all_reduce(finite_tensor, op=dist.ReduceOp.MIN)  # 0 if any rank has non-finite
+
+                if finite_tensor.item() == 0:
                     if rank == 0:
-                        print("[WARN][DISC21] Non-finite loss encountered; skipping batch.")
+                        print("[WARN][DISC21] Non-finite loss encountered on one or more ranks; skipping batch on all ranks.")
                     accumulation_counter = 0
                     optimizer.zero_grad(set_to_none=True)
                     continue
@@ -624,9 +629,15 @@ def main():
 
                     loss_asl = asl_loss(v_former=v_former, v_latter=v_latter, lambda_mtr=cfg.lambda_asl_mtr)
 
-                if not torch.isfinite(loss_asl):
+                # NaN / inf guard - synchronize across all ranks to prevent deadlock
+                import torch.distributed as dist
+                is_finite = torch.isfinite(loss_asl)
+                finite_tensor = torch.tensor(1 if is_finite else 0, device=device)
+                dist.all_reduce(finite_tensor, op=dist.ReduceOp.MIN)  # 0 if any rank has non-finite
+
+                if finite_tensor.item() == 0:
                     if rank == 0:
-                        print("[WARN][NDEC] Non-finite ASL loss encountered; skipping batch.")
+                        print("[WARN][NDEC] Non-finite ASL loss encountered on one or more ranks; skipping batch on all ranks.")
                     optimizer.zero_grad(set_to_none=True)
                     continue
 
